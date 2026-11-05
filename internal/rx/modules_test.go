@@ -1,0 +1,338 @@
+package rx_test
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/drxinfra/rxmcp/internal/rx"
+)
+
+func TestKnowledgeBase(t *testing.T) {
+	f := newFake(t)
+	s := newSvc(t, f)
+	ctx := context.Background()
+	areas, err := s.KBAreas(ctx, "")
+	if err != nil || len(areas) != 1 {
+		t.Fatalf("areas: %v %d", err, len(areas))
+	}
+	if txt := rx.AreasText(areas); !strings.Contains(txt, "#115 Общая область · стартовая статья #1 Старт · общая") {
+		t.Errorf("areas text: %s", txt)
+	}
+	items, _, err := s.KBFindArticles(ctx, rx.ArticleFilter{AreaID: 115})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("find: %v %d", err, len(items))
+	}
+	if line := s.F.ArticleLine(items[0]); !strings.Contains(line, "#2 Оформление статьи · Общая область · Автор · 06.05.2026") {
+		t.Errorf("line: %s", line)
+	}
+	if !f.has("LifeCycleState+eq+%27Active%27") {
+		t.Error("без include_drafts должен быть фильтр по состоянию")
+	}
+	a, body, err := s.KBArticle(ctx, 2)
+	if err != nil || !strings.HasPrefix(body, "# Заголовок") {
+		t.Fatalf("article: %v %q", err, body)
+	}
+	card := s.F.ArticleCard(*a, body, false, 0, 0)
+	for _, want := range []string{"Статья #2", "Теги: howto", "Области: Общая область (#115)", "Текст статьи (markdown"} {
+		if !strings.Contains(card, want) {
+			t.Errorf("card без %q:\n%s", want, card)
+		}
+	}
+	if _, _, err := s.KBFindArticles(ctx, rx.ArticleFilter{}); err == nil {
+		t.Error("поиск без условий должен отказывать")
+	}
+}
+
+func TestBoards(t *testing.T) {
+	f := newFake(t)
+	s := newSvc(t, f)
+	ctx := context.Background()
+	boards, err := s.Boards(ctx, "", false, 0)
+	if err != nil || len(boards) != 1 {
+		t.Fatalf("boards: %v", err)
+	}
+	if line := rx.BoardLine(boards[0]); line != "#2 Доска команды [DK] · владелец Владелец" {
+		t.Errorf("board line: %s", line)
+	}
+	bd, cols, err := s.BoardByID(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cols) != 2 || cols[0].Name != "Новые" || cols[1].Name != "В работе" {
+		t.Fatalf("порядок колонок по IndexColumn: %+v", cols)
+	}
+	if len(cols[0].Tickets) != 1 {
+		t.Errorf("дубли карточек должны схлопываться: %d", len(cols[0].Tickets))
+	}
+	card := s.F.BoardCard(*bd, cols)
+	if !strings.Contains(card, "## Новые (1)") || !strings.Contains(card, "DK-3 (id 245) Задача 2 · Иванов Иван · срок") {
+		t.Errorf("board card:\n%s", card)
+	}
+	tk, err := s.TicketByID(ctx, 245)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc := s.F.TicketCard(*tk)
+	for _, want := range []string{"Карточка DK-3 (id 245)", "приоритет 8/10", "Исполнители: Иванов Иван", "Трудоёмкость: план 4.5", "Теги: bug", "1. Задача З-20 · объект RX id 20", "Сделать хорошо"} {
+		if !strings.Contains(tc, want) {
+			t.Errorf("ticket card без %q:\n%s", want, tc)
+		}
+	}
+	found, _, err := s.FindTickets(ctx, "dk-3", 0, "", 0)
+	if err != nil || len(found) != 1 {
+		t.Fatalf("find tickets: %v", err)
+	}
+	if !f.has("Uid+eq+%27DK-3%27") {
+		t.Error("код карточки должен искаться по Uid в верхнем регистре")
+	}
+}
+
+func TestProjects(t *testing.T) {
+	f := newFake(t)
+	s := newSvc(t, f)
+	ctx := context.Background()
+	items, _, err := s.Projects(ctx, rx.ProjectFilter{})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("projects: %v", err)
+	}
+	if line := s.F.ProjectLine(items[0]); !strings.Contains(line, "#2 Проект (П) · исполнение · состояние: есть риски · рук. Руководитель · 06.05.2026–— · 40%") {
+		t.Errorf("project line: %s", line)
+	}
+	p, plans, err := s.ProjectByID(ctx, 2)
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("project: %v %d", err, len(plans))
+	}
+	card := s.F.ProjectCard(*p, plans)
+	for _, want := range []string{"Проект #2: Проект", "руководство: Руководитель", "участники: Иванов Иван", "#1 G1 · план 01.06.2026 · достигнута 02.06.2026", "#55 План проекта · черновик"} {
+		if !strings.Contains(card, want) {
+			t.Errorf("project card без %q:\n%s", want, card)
+		}
+	}
+	pl, m, names, err := s.PlanByID(ctx, 55)
+	if err != nil || m == nil || len(m.Activities) != 3 || names[7] != "Иванов Иван" {
+		t.Fatalf("plan: %v %+v %v", err, m, names)
+	}
+	pc := s.F.PlanCard(*pl, m, names, 150)
+	for _, want := range []string{"▸ Раздел · 24.09.26–28.09.26", "  • Работа · 01.01.20–05.01.20 · Иванов Иван · 50% · ПРОСРОЧЕНО", "  ◆ Веха · —–01.10.26 · 100%", "Итого: выполнено 1, просрочено 1 из 3."} {
+		if !strings.Contains(pc, want) {
+			t.Errorf("plan card без %q:\n%s", want, pc)
+		}
+	}
+	if pc2 := s.F.PlanCard(*pl, m, names, 1); !strings.Contains(pc2, "показано 1 работ из 3") {
+		t.Errorf("max_rows: %s", pc2)
+	}
+}
+
+// agileActions оставляет из записанных действий только действия досок.
+func agileActions(f *fakeRX) []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []map[string]any
+	for _, a := range f.actions {
+		if strings.HasPrefix(a["_action"].(string), "AgileBoards/") {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func TestCreateColumn(t *testing.T) {
+	f := newFake(t)
+	s := newSvc(t, f)
+	ctx := context.Background()
+	// Без места обычная колонка встаёт перед финальной «Готово»; закрытая «Старая» не считается.
+	b, col, pos, notes, err := s.CreateColumn(ctx, rx.ColumnInput{Board: "2", Name: " На проверке ", WipLimit: 5})
+	if err != nil || b.ID != 2 || col.ID != 21 || col.Name != "На проверке" || pos != 3 || len(notes) != 0 {
+		t.Fatalf("create: %v %+v pos=%d notes=%v", err, col, pos, notes)
+	}
+	acts := agileActions(f)
+	if len(acts) != 3 {
+		t.Fatalf("ждали CreateColumn, UpdateColumnConfig, MoveColumn: %+v", acts)
+	}
+	if acts[0]["_action"] != "AgileBoards/CreateColumn" || acts[0]["boardId"] != float64(2) {
+		t.Errorf("create: %+v", acts[0])
+	}
+	if u := acts[1]; u["_action"] != "AgileBoards/UpdateColumnConfig" || u["columnId"] != float64(21) || u["name"] != "На проверке" || u["isFinal"] != false || u["wipLimit"] != float64(5) {
+		t.Errorf("config: %+v", u)
+	}
+	if m := acts[2]; m["_action"] != "AgileBoards/MoveColumn" || m["columnRefId"] != float64(31) || m["position"] != float64(2) {
+		t.Errorf("move (позиции RX с нуля): %+v", m)
+	}
+	// Явное место считается с единицы.
+	if _, _, pos, _, err := s.CreateColumn(ctx, rx.ColumnInput{Board: "2", Name: "Бэклог", Position: 1}); err != nil || pos != 1 {
+		t.Fatalf("position 1: %v %d", err, pos)
+	}
+	if m := agileActions(f)[5]; m["position"] != float64(0) {
+		t.Errorf("move на первое место: %+v", m)
+	}
+	// Финальная без места остаётся в конце: MoveColumn не нужен.
+	n := len(agileActions(f))
+	if _, _, pos, _, err := s.CreateColumn(ctx, rx.ColumnInput{Board: "2", Name: "Архив", IsFinal: true}); err != nil || pos != 4 {
+		t.Fatalf("final: %v %d", err, pos)
+	}
+	if got := len(agileActions(f)) - n; got != 2 {
+		t.Errorf("для финальной в конце ждали 2 действия, было %d", got)
+	}
+	// Дубль имени отклоняется до любых действий.
+	n = len(agileActions(f))
+	if _, _, _, _, err := s.CreateColumn(ctx, rx.ColumnInput{Board: "2", Name: "в работе"}); err == nil || !strings.Contains(err.Error(), "уже есть") {
+		t.Errorf("дубль: %v", err)
+	}
+	if _, _, _, _, err := s.CreateColumn(ctx, rx.ColumnInput{Board: "2", Name: "  "}); err == nil {
+		t.Error("пустое имя должно отклоняться")
+	}
+	if len(agileActions(f)) != n {
+		t.Error("при ошибке проверки на доску ничего не должно уходить")
+	}
+}
+
+func TestRemoveTickets(t *testing.T) {
+	f := newFake(t)
+	s := newSvc(t, f)
+	ctx := context.Background()
+	ts, err := s.TicketsByIDs(ctx, []int64{245, 245, 0})
+	if err != nil || len(ts) != 1 || ts[0].BoardID != 2 {
+		t.Fatalf("tickets: %v %+v", err, ts)
+	}
+	if _, err := s.TicketsByIDs(ctx, nil); err == nil {
+		t.Error("пустой список должен отклоняться")
+	}
+	// 250 висит на доске двумя ссылками, одна заблокирована; 777 на доске нет.
+	ts = append(ts, rx.Ticket{ID: 250, UID: "DK-5", BoardID: 2}, rx.Ticket{ID: 777, BoardID: 2})
+	res, err := s.RemoveTickets(ctx, ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Removed) != 1 || res.Removed[0].ID != 245 || len(res.Blocked) != 1 || res.Blocked[0].ID != 250 || len(res.NotOnBoard) != 1 || res.NotOnBoard[0].ID != 777 {
+		t.Fatalf("итог: %+v", res)
+	}
+	acts := agileActions(f)
+	if len(acts) != 1 || acts[0]["_action"] != "AgileBoards/RemoveTickets" || acts[0]["boardId"] != float64(2) {
+		t.Fatalf("ждали одно RemoveTickets на доску: %+v", acts)
+	}
+	refs := acts[0]["ticketRefIds"].([]any)
+	if len(refs) != 3 || refs[0] != float64(901) {
+		t.Errorf("снимаются ссылки, а не Id карточек, и все ссылки дубля: %v", refs)
+	}
+}
+
+// Вложения уходят в SaveTicket записями «название и адрес»: ссылка как есть,
+// документ RX гиперссылкой на стенд, файл через загрузку в хранилище досок.
+func TestTicketAttachments(t *testing.T) {
+	f := newFake(t)
+	s := newSvc(t, f)
+	ctx := context.Background()
+	file := filepath.Join(t.TempDir(), "отчёт.pdf")
+	if err := os.WriteFile(file, []byte("%PDF-1.4"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := s.UpdateTicket(ctx, 245, rx.TicketInput{Attachments: []rx.AttachmentInput{
+		{URL: "https://example.com/a"},
+		{DocumentID: 300, Name: "Договор"},
+		{File: file},
+	}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var save, upload map[string]any
+	for _, a := range agileActions(f) {
+		switch a["_action"] {
+		case "AgileBoards/SaveTicket":
+			save = a
+		case "AgileBoards/UploadPersistedBinaryData":
+			upload = a
+		}
+	}
+	if upload == nil || upload["file"] != "JVBERi0xLjQ=" {
+		t.Fatalf("файл должен уйти в хранилище в base64: %v", upload)
+	}
+	atts := save["ticketReference"].(map[string]any)["Ticket"].(map[string]any)["Attachments"].([]any)
+	if len(atts) != 3 {
+		t.Fatalf("вложения: %v", atts)
+	}
+	want := []struct{ url, name string }{
+		{"https://example.com/a", "https://example.com/a"},
+		{"/Sungero?type=030d8d67-9b94-4f0d-bcc6-691016eb70f3&id=300", "Договор"},
+		{"storage://4242&application/pdf", "отчёт.pdf"},
+	}
+	for i, w := range want {
+		a := atts[i].(map[string]any)
+		if !strings.HasSuffix(a["Url"].(string), w.url) || a["Name"] != w.name || a["State"] != "Added" || a["Id"] != float64(-1) {
+			t.Errorf("вложение %d: %v", i, a)
+		}
+	}
+	for _, bad := range []rx.AttachmentInput{{}, {URL: "ftp://x/y"}, {URL: "https://a", DocumentID: 1}, {File: filepath.Join(t.TempDir(), "нет")}} {
+		if _, _, err := s.UpdateTicket(ctx, 245, rx.TicketInput{Attachments: []rx.AttachmentInput{bad}}, ""); err == nil {
+			t.Errorf("должно отклоняться: %+v", bad)
+		}
+	}
+}
+
+// SaveTicket перезаписывает план, факт, название, приоритет и срок тем, что
+// пришло в запросе. Обновление, которое их не передало, обнуляло часы карточки.
+// Позиция 0 поднимала карточку в начало колонки даже без переноса.
+func TestUpdateTicketKeepsHoursAndPlace(t *testing.T) {
+	ctx := context.Background()
+	lastSave := func(f *fakeRX) map[string]any {
+		var save map[string]any
+		for _, a := range agileActions(f) {
+			if a["_action"] == "AgileBoards/SaveTicket" {
+				save = a
+			}
+		}
+		if save == nil {
+			t.Fatal("SaveTicket не вызван")
+		}
+		return save["ticketReference"].(map[string]any)
+	}
+
+	f := newFake(t)
+	s := newSvc(t, f)
+	if _, _, err := s.UpdateTicket(ctx, 245, rx.TicketInput{Tags: []string{"7"}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	ref := lastSave(f)
+	tk := ref["Ticket"].(map[string]any)
+	if tk["PlannedWorkload"] != 4.5 || tk["ActualWorkload"] != 2.25 {
+		t.Errorf("план и факт должны уйти текущими: %v / %v", tk["PlannedWorkload"], tk["ActualWorkload"])
+	}
+	if tk["Name"] != "Задача 2" || tk["Priority"] != float64(8) || tk["Deadline"] == nil {
+		t.Errorf("название, приоритет и срок должны уйти текущими: %v", tk)
+	}
+	if ref["Position"] != float64(-1) || ref["ColumnId"] != float64(11) {
+		t.Errorf("без переноса место не задаётся: %v", ref)
+	}
+
+	f = newFake(t)
+	s = newSvc(t, f)
+	plan := 8.0
+	if _, _, err := s.UpdateTicket(ctx, 245, rx.TicketInput{PlanHours: &plan}, "Новые"); err != nil {
+		t.Fatal(err)
+	}
+	ref = lastSave(f)
+	tk = ref["Ticket"].(map[string]any)
+	if tk["PlannedWorkload"] != 8.0 || tk["ActualWorkload"] != 2.25 {
+		t.Errorf("план меняется, факт остаётся: %v / %v", tk["PlannedWorkload"], tk["ActualWorkload"])
+	}
+	if ref["Position"] != float64(0) || ref["ColumnId"] != float64(10) {
+		t.Errorf("перенос ставит в начало новой колонки: %v", ref)
+	}
+}
+
+// Поиск сотрудника: каждое слово ищется в ФИО, должности и подразделении, слова через and.
+func TestFindEmployeesByJobAndDepartment(t *testing.T) {
+	f := newFake(t)
+	s := newSvc(t, f)
+	items, err := s.FindEmployees(context.Background(), "начальник  закупок", false, 5)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("find: %v %d", err, len(items))
+	}
+	want := "(contains(tolower(Name),'начальник') or contains(tolower(JobTitle/Name),'начальник') or contains(tolower(Department/Name),'начальник')) and " +
+		"(contains(tolower(Name),'закупок') or contains(tolower(JobTitle/Name),'закупок') or contains(tolower(Department/Name),'закупок')) and Status eq 'Active'"
+	if !f.hasQuery("IEmployees", want) {
+		t.Errorf("фильтр не тот, запросы: %v", f.calls)
+	}
+}

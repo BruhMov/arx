@@ -1,0 +1,631 @@
+// Package odata: минимальный клиент сервиса интеграции Directum RX.
+// Умеет ровно то, что нужно rxmcp: GET коллекций и сущностей с $-параметрами,
+// POST действий модулей, скачивание тела версии. Никаких PATCH и DELETE.
+package odata
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Client держит HTTP-клиент и способ аутентификации.
+type Client struct {
+	base       string
+	auth       string
+	login      string
+	pass       string
+	token      string
+	cookie     string
+	cookieFn   func() (string, error)
+	cookieSave func(string) error
+	cookieNew  func(context.Context) error
+	renewMu    sync.Mutex // одно продление куки за раз на весь клиент
+	renewed    atomic.Int64
+	tokenFn    func(context.Context) (string, error)
+	http       *http.Client
+	MaxBody    int64
+}
+
+// Options параметры создания клиента.
+type Options struct {
+	BaseURL  string
+	Auth     string
+	Login    string
+	Password string
+	Token    string
+	Cookie   string
+	// CookieFunc отдаёт актуальную куку. Читается на каждом запросе, поэтому
+	// обновление куки не требует перезапуска клиента. Имеет приоритет над Cookie.
+	CookieFunc func() (string, error)
+	// CookieSave сохраняет куку, которую RX прислал в ответе (Set-Cookie). Получает заголовок
+	// Cookie целиком, с уже заменёнными значениями.
+	CookieSave func(string) error
+	// CookieRenew получает новую куку, когда RX ответил 401 (вход через сессию провайдера,
+	// rxmcp login --sso). Если вернула nil, запрос повторяется один раз с новой кукой.
+	CookieRenew func(context.Context) error
+	// TokenFunc выдаёт актуальный bearer-токен (OIDC с обновлением). Имеет приоритет над Token.
+	TokenFunc   func(context.Context) (string, error)
+	Timeout     time.Duration
+	InsecureTLS bool
+	CAFile      string
+}
+
+// Error ошибка ответа RX с кодом.
+type Error struct {
+	Status int
+	Method string
+	Path   string
+	Detail string
+}
+
+func (e *Error) Error() string {
+	switch e.Status {
+	case 401:
+		return "RX отклонил учётку (401). Для basic проверьте логин и пароль (у логина должен быть тип «пароль»). Для cookie сессия истекла: войдите в RX в браузере и выполните `rxmcp login --paste` (или один раз `rxmcp login --sso`, тогда rxmcp будет обновлять куку сам), перезапускать Claude не нужно. Для oidc: `rxmcp login`"
+	case 403:
+		return "нет прав (403): у этой учётки нет доступа к объекту или к сервису интеграции"
+	case 404:
+		if e.Method == "POST" {
+			return "RX вернул 404 на действие " + e.Path + ": так он отвечает, когда не хватает обязательного параметра (например, срока или результата) или объект недоступен"
+		}
+		return "объект не найден или недоступен (404)"
+	}
+	if e.Detail != "" {
+		return fmt.Sprintf("RX вернул %d на %s %s: %s", e.Status, e.Method, e.Path, e.Detail)
+	}
+	return fmt.Sprintf("RX вернул %d на %s %s", e.Status, e.Method, e.Path)
+}
+
+// NewTransport транспорт с настройками TLS из профиля. Общий для OData и входа через веб-клиент.
+func NewTransport(insecure bool, caFile string) (*http.Transport, error) {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	if insecure {
+		tr.TLSClientConfig.InsecureSkipVerify = true //nolint:gosec // осознанный выбор пользователя
+	}
+	if caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("RXMCP_CA: %w", err)
+		}
+		pool, _ := x509.SystemCertPool()
+		if pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, errors.New("RXMCP_CA: в файле нет сертификатов PEM")
+		}
+		tr.TLSClientConfig.RootCAs = pool
+	}
+	return tr, nil
+}
+
+// New создаёт клиент.
+func New(o Options) (*Client, error) {
+	tr, err := NewTransport(o.InsecureTLS, o.CAFile)
+	if err != nil {
+		return nil, err
+	}
+	if o.Timeout == 0 {
+		o.Timeout = 30 * time.Second
+	}
+	return &Client{
+		base:       strings.TrimRight(o.BaseURL, "/"),
+		auth:       o.Auth,
+		login:      o.Login,
+		pass:       o.Password,
+		token:      o.Token,
+		cookie:     o.Cookie,
+		cookieFn:   o.CookieFunc,
+		cookieSave: o.CookieSave,
+		cookieNew:  o.CookieRenew,
+		tokenFn:    o.TokenFunc,
+		http:       &http.Client{Transport: tr, Timeout: o.Timeout},
+		MaxBody:    64 << 20, // тела версий документов бывают большими (сканы, вложения)
+	}, nil
+}
+
+// Renewed сколько раз за жизнь клиента RX прислал новую куку и она сохранена.
+func (c *Client) Renewed() int64 { return c.renewed.Load() }
+
+func (c *Client) do(req *http.Request) (*http.Response, error) {
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	c.absorb(resp)
+	if resp.StatusCode != http.StatusUnauthorized || c.auth != "cookie" || c.cookieNew == nil {
+		return resp, nil
+	}
+	// Кука истекла: берём новую через сессию провайдера и повторяем запрос один раз.
+	if rerr := c.renewCookie(req.Context(), req.Header.Get("Cookie")); rerr != nil {
+		fmt.Fprintf(os.Stderr, "rxmcp: новую куку получить не удалось: %v\n", rerr)
+		return resp, nil
+	}
+	retry := req.Clone(req.Context())
+	if req.GetBody != nil {
+		body, berr := req.GetBody()
+		if berr != nil {
+			return resp, nil
+		}
+		retry.Body = body
+	}
+	if err := c.setAuth(retry); err != nil {
+		return resp, nil
+	}
+	resp.Body.Close()
+	resp, err = c.http.Do(retry)
+	if err == nil {
+		c.absorb(resp)
+	}
+	return resp, err
+}
+
+// renewCookie получает новую куку, но не чаще, чем нужно. Параллельные запросы получают
+// 401 одновременно, и раньше каждый сам входил заново. Каждый новый вход RX делает
+// недействительной куку предыдущего, поэтому часть повторов снова получала 401, «через раз».
+// Теперь продление идёт под мьютексом, а перед ним сверяется кука в файле с той, что ушла
+// в запросе (sent): если она уже другая, её только что обновил соседний запрос или другой
+// процесс rxmcp с тем же каталогом настроек, и достаточно повторить запрос с ней.
+func (c *Client) renewCookie(ctx context.Context, sent string) error {
+	c.renewMu.Lock()
+	defer c.renewMu.Unlock()
+	if c.cookieFn != nil {
+		// sent пустой, когда куки не было вовсе: тогда хватит того, что она появилась.
+		if cur, err := c.cookieFn(); err == nil && cur != "" && cur != sent {
+			if Debug {
+				fmt.Fprintln(os.Stderr, "rxmcp: кука уже обновлена другим запросом, повторяю с ней")
+			}
+			return nil
+		}
+	}
+	if err := c.cookieNew(ctx); err != nil {
+		return err
+	}
+	c.renewed.Add(1)
+	if Debug {
+		fmt.Fprintln(os.Stderr, "rxmcp: получена новая кука через сессию провайдера")
+	}
+	return nil
+}
+
+// absorb сохраняет куку, которую RX выдал в ответ. Сессия RX бывает скользящей: сервер
+// продлевает её на запросах и присылает новое значение. Без этого продлённая кука терялась,
+// а старая к утру истекала.
+func (c *Client) absorb(resp *http.Response) {
+	if c.auth != "cookie" || c.cookieSave == nil || resp.StatusCode >= 400 {
+		return
+	}
+	if b, err := url.Parse(c.base); err != nil || b.Host != resp.Request.URL.Host {
+		return
+	}
+	set := resp.Cookies()
+	if len(set) == 0 {
+		return
+	}
+	if Debug {
+		names := make([]string, 0, len(set))
+		for _, s := range set {
+			names = append(names, s.Name)
+		}
+		fmt.Fprintf(os.Stderr, "rxmcp: RX прислал куки: %s\n", strings.Join(names, ", "))
+	}
+	next, changed := MergeCookies(resp.Request.Header.Get("Cookie"), set, time.Now())
+	if !changed {
+		return
+	}
+	if err := c.cookieSave(next); err != nil {
+		fmt.Fprintf(os.Stderr, "rxmcp: новую куку RX сохранить не удалось: %v\n", err)
+		return
+	}
+	c.renewed.Add(1)
+}
+
+// MergeCookies подставляет в заголовок Cookie новые значения из Set-Cookie. Меняются только
+// куки, которые в заголовке уже есть: посторонние (балансировщик, аналитика) не копим.
+// Удаление куки (пустое значение, истёкший срок) не применяем: этим RX отвечает на выход,
+// а сохранённую куку человек убирает сам через rxmcp logout.
+func MergeCookies(header string, set []*http.Cookie, now time.Time) (string, bool) {
+	parts := strings.Split(header, ";")
+	changed := false
+	for _, s := range set {
+		if s.Value == "" || s.MaxAge < 0 || (!s.Expires.IsZero() && s.Expires.Before(now)) {
+			continue
+		}
+		for i, p := range parts {
+			name, val, ok := strings.Cut(strings.TrimSpace(p), "=")
+			if !ok || name != s.Name {
+				continue
+			}
+			if val != s.Value {
+				parts[i] = name + "=" + s.Value
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return header, false
+	}
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return strings.Join(parts, "; "), true
+}
+
+// Base возвращает корень OData.
+func (c *Client) Base() string { return c.base }
+
+func (c *Client) setAuth(r *http.Request) error {
+	switch c.auth {
+	case "header":
+		r.Header.Set("Username", c.login)
+		r.Header.Set("Password", c.pass)
+	case "bearer", "oidc":
+		tok := c.token
+		if c.tokenFn != nil {
+			t, err := c.tokenFn(r.Context())
+			if err != nil {
+				return err
+			}
+			tok = t
+		}
+		r.Header.Set("Authorization", "Bearer "+tok)
+	case "cookie":
+		ck := c.cookie
+		if c.cookieFn != nil {
+			v, err := c.cookieFn()
+			// Куки ещё нет (первый запуск, logout файла куки), а сессия провайдера есть: получаем.
+			if err != nil && c.cookieNew != nil {
+				if rerr := c.renewCookie(r.Context(), ""); rerr == nil {
+					v, err = c.cookieFn()
+				}
+			}
+			if err != nil {
+				return fmt.Errorf("нет сохранённой куки: %w", err)
+			}
+			ck = v
+		}
+		r.Header.Set("Cookie", ck)
+	default:
+		r.SetBasicAuth(c.login, c.pass)
+	}
+	return nil
+}
+
+// Query параметры OData-запроса.
+type Query struct {
+	Filter  string
+	Select  string
+	Expand  string
+	OrderBy string
+	Top     int
+	Skip    int
+	Count   bool
+}
+
+func (q Query) values() url.Values {
+	v := url.Values{}
+	if q.Filter != "" {
+		v.Set("$filter", q.Filter)
+	}
+	if q.Select != "" {
+		v.Set("$select", q.Select)
+	}
+	if q.Expand != "" {
+		v.Set("$expand", q.Expand)
+	}
+	if q.OrderBy != "" {
+		v.Set("$orderby", q.OrderBy)
+	}
+	if q.Top > 0 {
+		v.Set("$top", fmt.Sprint(q.Top))
+	}
+	if q.Skip > 0 {
+		v.Set("$skip", fmt.Sprint(q.Skip))
+	}
+	if q.Count {
+		v.Set("$count", "true")
+	}
+	return v
+}
+
+// Page ответ на запрос коллекции.
+type Page struct {
+	Count *int64            `json:"@odata.count"`
+	Value []json.RawMessage `json:"value"`
+	Next  string            `json:"@odata.nextLink"`
+}
+
+// List читает коллекцию: GET {base}/{set}?$…
+func (c *Client) List(ctx context.Context, set string, q Query) (*Page, error) {
+	body, err := c.get(ctx, set, q.values())
+	if err != nil {
+		return nil, err
+	}
+	if len(body) == 0 {
+		// RX отвечает 204 без тела, когда выборка пуста.
+		zero := int64(0)
+		return &Page{Count: &zero}, nil
+	}
+	var p Page
+	if err := json.Unmarshal(body, &p); err != nil {
+		return nil, fmt.Errorf("ответ RX не разобран: %w", err)
+	}
+	return &p, nil
+}
+
+// Get читает одну сущность: GET {base}/{set}({id})?$…
+func (c *Client) Get(ctx context.Context, set string, id int64, q Query, out any) error {
+	body, err := c.get(ctx, fmt.Sprintf("%s(%d)", set, id), q.values())
+	if err != nil {
+		return err
+	}
+	if len(body) == 0 {
+		return &Error{Status: 404, Method: "GET", Path: fmt.Sprintf("%s(%d)", set, id)}
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("ответ RX не разобран: %w", err)
+	}
+	return nil
+}
+
+// One читает одну сущность как есть: GET {base}/{set}({id})?$…
+func (c *Client) One(ctx context.Context, set string, id int64, q Query) ([]byte, error) {
+	body, err := c.get(ctx, fmt.Sprintf("%s(%d)", set, id), q.values())
+	if err != nil {
+		return nil, err
+	}
+	if len(body) == 0 {
+		return nil, &Error{Status: 404, Method: "GET", Path: fmt.Sprintf("%s(%d)", set, id)}
+	}
+	return body, nil
+}
+
+// Raw делает GET по относительному пути и возвращает тело как есть.
+func (c *Client) Raw(ctx context.Context, path string) ([]byte, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/"+strings.TrimLeft(path, "/"), nil)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := c.setAuth(req); err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("Accept", "*/*")
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, "", netErr(err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, c.MaxBody+1))
+	if err != nil {
+		return nil, "", err
+	}
+	c.debug("GET", path, resp.StatusCode, len(data))
+	if resp.StatusCode >= 300 {
+		return nil, "", &Error{Status: resp.StatusCode, Method: "GET", Path: path, Detail: detail(data)}
+	}
+	if int64(len(data)) > c.MaxBody {
+		return nil, "", fmt.Errorf("тело больше %d МБ, не читаем", c.MaxBody>>20)
+	}
+	return data, resp.Header.Get("Content-Type"), nil
+}
+
+// Abs читает абсолютный адрес (справка лежит рядом с веб-клиентом, вне OData) и возвращает
+// тело и итоговый адрес после перенаправлений. Учётка добавляется только на тот же хост, что у RX.
+func (c *Client) Abs(ctx context.Context, rawURL string) ([]byte, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	if b, err := url.Parse(c.base); err == nil && b.Host == req.URL.Host {
+		if err := c.setAuth(req); err != nil {
+			return nil, "", err
+		}
+	}
+	req.Header.Set("Accept", "text/html,*/*")
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, "", netErr(err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, c.MaxBody))
+	if err != nil {
+		return nil, "", err
+	}
+	c.debug("GET", rawURL, resp.StatusCode, len(data))
+	if resp.StatusCode >= 300 {
+		return nil, "", &Error{Status: resp.StatusCode, Method: "GET", Path: rawURL}
+	}
+	return data, resp.Request.URL.String(), nil
+}
+
+// Action вызывает действие модуля: POST {base}/{module}/{action} с JSON-параметрами.
+// Возвращает тело ответа (может быть пустым).
+func (c *Client) Action(ctx context.Context, module, action string, params map[string]any) ([]byte, error) {
+	return c.send(ctx, http.MethodPost, module+"/"+action, params)
+}
+
+// Create создаёт запись набора (POST {набор}) и возвращает её JSON. Нужен узким
+// инструментам вроде создания статьи базы знаний; произвольные записи сервер не создаёт.
+func (c *Client) Create(ctx context.Context, set string, body map[string]any) ([]byte, error) {
+	return c.send(ctx, http.MethodPost, set, body)
+}
+
+// Patch меняет поля записи (PATCH {набор}(Id)).
+func (c *Client) Patch(ctx context.Context, set string, id int64, body map[string]any) error {
+	_, err := c.send(ctx, http.MethodPatch, fmt.Sprintf("%s(%d)", set, id), body)
+	return err
+}
+
+// Delete удаляет запись (DELETE {набор}(Id)).
+func (c *Client) Delete(ctx context.Context, set string, id int64) error {
+	_, err := c.send(ctx, http.MethodDelete, fmt.Sprintf("%s(%d)", set, id), nil)
+	return err
+}
+
+// ActionBinary вызывает действие, которое возвращает файл (Edm.Binary): RX отдаёт его
+// base64-строкой в {"value": …}. Ответ читается до MaxBody, а не до 1 МБ, как у прочих действий.
+func (c *Client) ActionBinary(ctx context.Context, module, action string, params map[string]any) ([]byte, error) {
+	data, err := c.sendN(ctx, http.MethodPost, module+"/"+action, params, c.MaxBody+1)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > c.MaxBody {
+		return nil, fmt.Errorf("ответ больше %d МБ, не читаем", c.MaxBody>>20)
+	}
+	var r struct {
+		Value []byte `json:"value"` // encoding/json раскрывает base64 сам
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("%s/%s: ответ не разобран: %w", module, action, err)
+	}
+	return r.Value, nil
+}
+
+func (c *Client) send(ctx context.Context, method, path string, params map[string]any) ([]byte, error) {
+	return c.sendN(ctx, method, path, params, 1<<20)
+}
+
+func (c *Client) sendN(ctx context.Context, method, path string, params map[string]any, limit int64) ([]byte, error) {
+	var body io.Reader
+	if params != nil || method == http.MethodPost {
+		payload, err := json.Marshal(params)
+		if err != nil {
+			return nil, err
+		}
+		body = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.base+"/"+path, body)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.setAuth(req); err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, netErr(err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, limit))
+	c.debug(method, path, resp.StatusCode, len(data))
+	if Debug && resp.StatusCode >= 300 {
+		b := data
+		if len(b) > 600 {
+			b = b[:600]
+		}
+		fmt.Fprintf(os.Stderr, "rxmcp: тело ответа: %s\n", string(b))
+	}
+	if resp.StatusCode >= 300 {
+		return nil, &Error{Status: resp.StatusCode, Method: method, Path: path, Detail: detail(data)}
+	}
+	return data, nil
+}
+
+func (c *Client) get(ctx context.Context, path string, v url.Values) ([]byte, error) {
+	u := c.base + "/" + path
+	if len(v) > 0 {
+		u += "?" + v.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.setAuth(req); err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, netErr(err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, c.MaxBody))
+	if err != nil {
+		return nil, err
+	}
+	c.debug("GET", u[len(c.base)+1:], resp.StatusCode, len(data))
+	if resp.StatusCode >= 300 {
+		return nil, &Error{Status: resp.StatusCode, Method: "GET", Path: path, Detail: detail(data)}
+	}
+	return data, nil
+}
+
+// Debug включает вывод запросов в stderr.
+var Debug = os.Getenv("RXMCP_DEBUG") != ""
+
+func (c *Client) debug(method, path string, status, n int) {
+	if Debug {
+		fmt.Fprintf(os.Stderr, "rxmcp: %s %s -> %d, %d байт\n", method, path, status, n)
+	}
+}
+
+// detail вытаскивает сообщение из OData-ошибки, без стека и внутренностей.
+func detail(data []byte) string {
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(data, &e) == nil && e.Error.Message != "" {
+		return cutStr(e.Error.Message, 300)
+	}
+	// RX часто отвечает голой JSON-строкой или текстом.
+	var str string
+	if json.Unmarshal(data, &str) == nil && str != "" {
+		return cutStr(str, 300)
+	}
+	t := strings.TrimSpace(string(data))
+	if t != "" && !strings.HasPrefix(t, "<") {
+		return cutStr(t, 300)
+	}
+	return ""
+}
+
+func cutStr(s string, n int) string {
+	r := []rune(s)
+	if len(r) > n {
+		return string(r[:n]) + "…"
+	}
+	return s
+}
+
+func netErr(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		if ue.Timeout() {
+			return fmt.Errorf("RX не ответил вовремя (%s)", ue.URL)
+		}
+		return fmt.Errorf("нет связи с RX: %v", ue.Err)
+	}
+	return err
+}
+
+// Quote экранирует строку для OData-литерала.
+func Quote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// Metadata запрашивает $metadata и возвращает размер (проверка связи).
+func (c *Client) Metadata(ctx context.Context) (int, error) {
+	data, _, err := c.Raw(ctx, "$metadata")
+	if err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
