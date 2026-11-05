@@ -1,0 +1,10 @@
+/dist/
+/rxmcp
+/rxmcp.exe
+*.test
+*.out
+.env
+.env.*
+*.local
+.DS_Store
+/bin/

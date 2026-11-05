@@ -1,0 +1,767 @@
+package rx
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/drxinfra/rxmcp/internal/odata"
+)
+
+// Запись в agile-доски идёт через действие AgileBoards/SaveTicket.
+// Особенности платформы, выясненные на живой системе:
+//   - новая сущность создаётся с отрицательным Id: и у ссылки, и у самой карточки
+//     нужен Id = -1, ноль означает «найди существующую» и даёт ошибку;
+//   - теги и исполнители передаются списком ссылок со State = "Added";
+//   - при обновлении карточка перезаписывается целиком, поэтому сначала
+//     читаем текущую и меняем только затронутые поля. Название, приоритет, срок,
+//     план (PlannedWorkload) и факт (ActualWorkload) сервер берёт из запроса
+//     всегда: не переданное поле обнуляется (ApplyTicketChanges в AgileBoards);
+//   - Position в ссылке сервер выполняет как перестановку: 0 поднимает карточку
+//     в начало колонки, -1 означает «место не задано» и оставляет её где была;
+//   - описание приводится к виду редактора веб-клиента (EditorMarkdown), иначе
+//     открытая карточка сразу считается изменённой и просит «Сохранить».
+
+const keepPosition = -1
+
+const newID = -1
+
+// appID передаётся действиям досок как имя приложения-источника изменения.
+const appID = "rxmcp"
+
+type ticketRef struct {
+	ID       int64      `json:"Id"`
+	Position int        `json:"Position"`
+	ColumnID int64      `json:"ColumnId"`
+	Ticket   ticketWire `json:"Ticket"`
+}
+
+type tagRef struct {
+	ID    int64  `json:"Id"`
+	State string `json:"State"`
+	TagID int64  `json:"TicketTagId"`
+}
+
+type perfRef struct {
+	ID     int64  `json:"Id"`
+	State  string `json:"State"`
+	PerfID int64  `json:"PerformerId"`
+}
+
+type ticketWire struct {
+	ID                  int64     `json:"Id"`
+	BoardID             int64     `json:"BoardId"`
+	Name                string    `json:"Name"`
+	Description         string    `json:"Description"`
+	Priority            int       `json:"Priority"`
+	Deadline            *string   `json:"Deadline,omitempty"`
+	PlannedWorkload     *float64  `json:"PlannedWorkload"`
+	ActualWorkload      *float64  `json:"ActualWorkload"`
+	IsEnabled           bool      `json:"IsEnabled"`
+	IsDescribed         bool      `json:"IsDescribed"`
+	Votes               int       `json:"Votes"`
+	CommentsCount       int       `json:"CommentsCount"`
+	AttachmentsCount    int       `json:"AttachmentsCount"`
+	ChildrenCount       int       `json:"ChildrenCount"`
+	IdleDays            int       `json:"IdleDays"`
+	ClosedChildrenCount int       `json:"ClosedChildrenCount"`
+	EntityVersion       int       `json:"EntityVersion"`
+	TicketsTags         []tagRef  `json:"TicketsTags,omitempty"`
+	Performers          []perfRef `json:"Performers,omitempty"`
+	Attachments         []attRef  `json:"Attachments,omitempty"`
+}
+
+// TicketInput описывает карточку в человеческих терминах: доску и колонку
+// можно называть по имени, исполнителей и теги тоже.
+type TicketInput struct {
+	Board       string // имя доски или её Id
+	Column      string // имя колонки или её Id; пусто = первая колонка доски
+	Name        string
+	Description string
+	Deadline    *time.Time
+	Priority    int      // 1..10, 0 = по умолчанию 5
+	PlanHours   *float64 // план, ч; nil = не трогать
+	FactHours   *float64 // факт, ч; nil = не трогать
+	Performers  []string // имена сотрудников или Id
+	Tags        []string // имена тегов
+	Attachments []AttachmentInput
+}
+
+// Notes собирает предупреждения, которые не являются ошибкой,
+// но о которых пользователю надо сказать (не нашли тег, не нашли человека).
+type Notes []string
+
+func (n *Notes) add(f string, a ...any) { *n = append(*n, fmt.Sprintf(f, a...)) }
+
+// ResolveBoard находит доску по Id или части имени.
+func (s *Service) ResolveBoard(ctx context.Context, q string) (*Board, error) {
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return nil, errors.New("не указана доска")
+	}
+	if id, err := strconv.ParseInt(q, 10, 64); err == nil {
+		var b Board
+		if err := s.c.Get(ctx, "IBoards", id, odata.Query{Select: "Id,Name,Prefix,Status"}, &b); err != nil {
+			return nil, fmt.Errorf("доска #%d: %w", id, err)
+		}
+		return &b, nil
+	}
+	page, err := s.c.List(ctx, "IBoards", odata.Query{
+		Filter: "Status eq 'Active' and (contains(Name," + odata.Quote(q) + ") or contains(Prefix," + odata.Quote(strings.ToUpper(q)) + "))",
+		Select: "Id,Name,Prefix,Status", Top: 5,
+	})
+	if err != nil {
+		return nil, err
+	}
+	bs, err := decodeList[Board](page)
+	if err != nil {
+		return nil, err
+	}
+	switch len(bs) {
+	case 0:
+		return nil, fmt.Errorf("доска %q не найдена, посмотрите список в rx_boards", q)
+	case 1:
+		return &bs[0], nil
+	}
+	var names []string
+	for _, b := range bs {
+		names = append(names, fmt.Sprintf("%s (#%d)", b.Name, b.ID))
+	}
+	return nil, fmt.Errorf("под %q подходит несколько досок: %s. Уточните название или укажите Id", q, strings.Join(names, ", "))
+}
+
+// resolveColumn находит колонку доски по Id или имени; пустой запрос даёт первую.
+func (s *Service) resolveColumn(ctx context.Context, boardID int64, q string) (*Column, error) {
+	page, err := s.c.List(ctx, "IColumns", odata.Query{
+		Filter: fmt.Sprintf("BoardId eq %d and Status eq 'Active'", boardID),
+		Select: "Id,Name,IsFinal,WipLimit,Status", Top: 50,
+	})
+	if err != nil {
+		return nil, err
+	}
+	cols, err := decodeList[Column](page)
+	if err != nil || len(cols) == 0 {
+		return nil, fmt.Errorf("у доски #%d нет активных колонок", boardID)
+	}
+	if err := s.orderColumns(ctx, boardID, cols); err != nil {
+		return nil, err
+	}
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return &cols[0], nil
+	}
+	if id, e := strconv.ParseInt(q, 10, 64); e == nil {
+		for i := range cols {
+			if cols[i].ID == id {
+				return &cols[i], nil
+			}
+		}
+		return nil, fmt.Errorf("колонки #%d нет на доске #%d", id, boardID)
+	}
+	lq := strings.ToLower(q)
+	for i := range cols {
+		if strings.EqualFold(cols[i].Name, q) {
+			return &cols[i], nil
+		}
+	}
+	for i := range cols {
+		if strings.Contains(strings.ToLower(cols[i].Name), lq) {
+			return &cols[i], nil
+		}
+	}
+	var names []string
+	for _, c := range cols {
+		names = append(names, c.Name)
+	}
+	return nil, fmt.Errorf("колонка %q не найдена. На доске есть: %s", q, strings.Join(names, ", "))
+}
+
+// orderColumns расставляет колонки в порядке доски (порядок хранится в самой доске).
+func (s *Service) orderColumns(ctx context.Context, boardID int64, cols []Column) error {
+	var bc struct {
+		Columns []struct {
+			IndexColumn int `json:"IndexColumn"`
+			Column      Ref `json:"Column"`
+		} `json:"Columns"`
+	}
+	if err := s.c.Get(ctx, "IBoards", boardID, odata.Query{Select: "Id", Expand: "Columns($select=IndexColumn;$expand=Column($select=Id))"}, &bc); err != nil {
+		return nil // порядок не критичен
+	}
+	idx := map[int64]int{}
+	for _, c := range bc.Columns {
+		idx[c.Column.ID] = c.IndexColumn
+	}
+	for i := 0; i < len(cols); i++ {
+		for j := i + 1; j < len(cols); j++ {
+			if idx[cols[j].ID] < idx[cols[i].ID] {
+				cols[i], cols[j] = cols[j], cols[i]
+			}
+		}
+	}
+	return nil
+}
+
+// resolveTags превращает имена тегов в идентификаторы. Создавать теги платформа
+// через этот API не даёт, поэтому ненайденные возвращаются отдельным списком.
+func (s *Service) resolveTags(ctx context.Context, names []string, notes *Notes) ([]int64, error) {
+	var ids []int64
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		if id, e := strconv.ParseInt(n, 10, 64); e == nil {
+			ids = append(ids, id)
+			continue
+		}
+		page, err := s.c.List(ctx, "INamedTags", odata.Query{
+			Filter: "Status eq 'Active' and contains(Name," + odata.Quote(n) + ")", Select: "Id,Name", Top: 5,
+		})
+		if err != nil {
+			return nil, err
+		}
+		tags, _ := decodeList[Ref](page)
+		if len(tags) == 0 {
+			notes.add("тег %q не найден, карточка создана без него: теги заводятся в интерфейсе доски", n)
+			continue
+		}
+		best := tags[0]
+		for _, t := range tags {
+			if strings.EqualFold(t.Name, n) {
+				best = t
+				break
+			}
+		}
+		ids = append(ids, best.ID)
+	}
+	return ids, nil
+}
+
+// resolvePerformers превращает имена сотрудников в идентификаторы.
+func (s *Service) resolvePerformers(ctx context.Context, names []string, notes *Notes) ([]int64, error) {
+	var ids []int64
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		if id, e := strconv.ParseInt(n, 10, 64); e == nil {
+			ids = append(ids, id)
+			continue
+		}
+		emps, err := s.FindEmployees(ctx, n, false, 5)
+		if err != nil {
+			return nil, err
+		}
+		if len(emps) == 0 {
+			notes.add("сотрудник %q не найден, карточка создана без него", n)
+			continue
+		}
+		if len(emps) > 1 {
+			var who []string
+			for _, e := range emps {
+				who = append(who, fmt.Sprintf("%s (#%d)", e.Name, e.ID))
+			}
+			return nil, fmt.Errorf("под %q подходит несколько сотрудников: %s. Уточните или укажите Id", n, strings.Join(who, ", "))
+		}
+		ids = append(ids, emps[0].ID)
+	}
+	return ids, nil
+}
+
+func refsFromTags(ids []int64) []tagRef {
+	out := make([]tagRef, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, tagRef{ID: newID, State: "Added", TagID: id})
+	}
+	return out
+}
+
+func refsFromPerformers(ids []int64) []perfRef {
+	out := make([]perfRef, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, perfRef{ID: newID, State: "Added", PerfID: id})
+	}
+	return out
+}
+
+type saveResult struct {
+	IsSuccessed   bool   `json:"IsSuccessed"`
+	ResultMessage string `json:"ResultMessage"`
+	OriginalID    int64  `json:"OriginalTicketId"`
+	TicketRef     struct {
+		ID       int64  `json:"Id"`
+		ColumnID int64  `json:"ColumnId"`
+		Ticket   Ticket `json:"Ticket"`
+	} `json:"TicketRef"`
+}
+
+func (s *Service) saveTicket(ctx context.Context, boardID int64, ref ticketRef) (*saveResult, error) {
+	data, err := s.c.Action(ctx, "AgileBoards", "SaveTicket", map[string]any{
+		"appId": appID, "boardId": boardID, "needLock": false, "ticketReference": ref,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var r saveResult
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("ответ доски не разобран: %w", err)
+	}
+	if !r.IsSuccessed {
+		msg := r.ResultMessage
+		if msg == "" {
+			msg = "доска отклонила изменение без объяснения"
+		}
+		return nil, errors.New(msg)
+	}
+	return &r, nil
+}
+
+// CreateTicket заводит карточку на доске.
+func (s *Service) CreateTicket(ctx context.Context, in TicketInput) (*Ticket, *Board, *Column, Notes, error) {
+	var notes Notes
+	if strings.TrimSpace(in.Name) == "" {
+		return nil, nil, nil, notes, errors.New("нужно название карточки")
+	}
+	b, err := s.ResolveBoard(ctx, in.Board)
+	if err != nil {
+		return nil, nil, nil, notes, err
+	}
+	col, err := s.resolveColumn(ctx, b.ID, in.Column)
+	if err != nil {
+		return nil, b, nil, notes, err
+	}
+	tagIDs, err := s.resolveTags(ctx, in.Tags, &notes)
+	if err != nil {
+		return nil, b, col, notes, err
+	}
+	perfIDs, err := s.resolvePerformers(ctx, in.Performers, &notes)
+	if err != nil {
+		return nil, b, col, notes, err
+	}
+	atts, err := s.resolveAttachments(ctx, in.Attachments)
+	if err != nil {
+		return nil, b, col, notes, err
+	}
+	pr := in.Priority
+	if pr <= 0 {
+		pr = 5
+	}
+	if pr > 10 {
+		pr = 10
+	}
+	t := ticketWire{
+		ID: newID, BoardID: b.ID, Name: in.Name, Description: EditorMarkdown(in.Description),
+		Priority: pr, IsEnabled: true, IsDescribed: in.Description != "",
+		TicketsTags: refsFromTags(tagIDs), Performers: refsFromPerformers(perfIDs),
+		Attachments: atts, AttachmentsCount: len(atts),
+		PlannedWorkload: in.PlanHours, ActualWorkload: in.FactHours,
+	}
+	if in.Deadline != nil {
+		d := in.Deadline.UTC().Format(time.RFC3339)
+		t.Deadline = &d
+	}
+	r, err := s.saveTicket(ctx, b.ID, ticketRef{ID: newID, Position: 0, ColumnID: col.ID, Ticket: t})
+	if err != nil {
+		return nil, b, col, notes, err
+	}
+	out := r.TicketRef.Ticket
+	if out.ID == 0 {
+		out.ID = r.OriginalID
+	}
+	// SaveTicket отдаёт карточку без раскрытых ссылок: ни тегов, ни исполнителей,
+	// ни автора. Перечитываем, иначе в ответе будет «не назначено» на только что
+	// назначенного человека.
+	return s.reread(ctx, out.ID, &out), b, col, notes, nil
+}
+
+// reread возвращает карточку, прочитанную обычным путём; если чтение не удалось,
+// отдаёт то, что вернула запись, — терять подтверждение из-за чтения незачем.
+func (s *Service) reread(ctx context.Context, id int64, fallback *Ticket) *Ticket {
+	if id == 0 {
+		return fallback
+	}
+	if t, err := s.TicketByID(ctx, id); err == nil {
+		return t
+	}
+	return fallback
+}
+
+// ticketPlacement находит ссылку карточки на доске: её Id и колонку.
+func (s *Service) ticketPlacement(ctx context.Context, boardID, ticketID int64) (refID int64, colID int64, err error) {
+	page, err := s.c.List(ctx, "IColumns", odata.Query{
+		Filter: fmt.Sprintf("BoardId eq %d and Status eq 'Active'", boardID),
+		Select: "Id,Name", Expand: "Tickets($select=Id,Position;$expand=Ticket($select=Id))", Top: 50,
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	cols, err := decodeList[Column](page)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, c := range cols {
+		for _, t := range c.Tickets {
+			if t.Ticket != nil && t.Ticket.ID == ticketID {
+				return t.ID, c.ID, nil
+			}
+		}
+	}
+	return 0, 0, fmt.Errorf("карточка #%d не найдена на доске #%d", ticketID, boardID)
+}
+
+// UpdateTicket меняет поля существующей карточки. Пустые поля не трогаются.
+func (s *Service) UpdateTicket(ctx context.Context, ticketID int64, in TicketInput, moveTo string) (*Ticket, Notes, error) {
+	var notes Notes
+	cur, err := s.TicketByID(ctx, ticketID)
+	if err != nil {
+		return nil, notes, err
+	}
+	refID, colID, err := s.ticketPlacement(ctx, cur.BoardID, ticketID)
+	if err != nil {
+		return nil, notes, err
+	}
+	// Без переноса место в колонке не задаём, иначе карточка всплывёт наверх.
+	pos := keepPosition
+	if moveTo != "" {
+		col, err := s.resolveColumn(ctx, cur.BoardID, moveTo)
+		if err != nil {
+			return nil, notes, err
+		}
+		if col.ID != colID {
+			colID, pos = col.ID, 0
+		}
+	}
+	t := ticketWire{
+		ID: cur.ID, BoardID: cur.BoardID, Name: cur.Name, Description: cur.Description,
+		Priority: 5, IsEnabled: true, IsDescribed: cur.Description != "",
+		Votes: cur.Votes, CommentsCount: cur.Comments,
+		PlannedWorkload: cur.Laborious, ActualWorkload: cur.Elapsed,
+	}
+	if in.PlanHours != nil {
+		t.PlannedWorkload = in.PlanHours
+	}
+	if in.FactHours != nil {
+		t.ActualWorkload = in.FactHours
+	}
+	if cur.Priority != nil {
+		t.Priority = *cur.Priority
+	}
+	if cur.Deadline != nil {
+		d := cur.Deadline.UTC().Format(time.RFC3339)
+		t.Deadline = &d
+	}
+	if in.Name != "" {
+		t.Name = in.Name
+	}
+	if in.Description != "" {
+		// новое описание в виде редактора клиента, иначе карточка при открытии
+		// просит «Сохранить»; старое уходит как было
+		t.Description = EditorMarkdown(in.Description)
+		t.IsDescribed = true
+	}
+	if in.Priority > 0 {
+		t.Priority = min(in.Priority, 10)
+	}
+	if in.Deadline != nil {
+		d := in.Deadline.UTC().Format(time.RFC3339)
+		t.Deadline = &d
+	}
+	if len(in.Tags) > 0 {
+		have := map[int64]bool{}
+		for _, x := range cur.TicketsTags {
+			if x.Tag != nil {
+				have[x.Tag.ID] = true
+			}
+		}
+		ids, err := s.resolveTags(ctx, in.Tags, &notes)
+		if err != nil {
+			return nil, notes, err
+		}
+		var add []int64
+		for _, id := range ids {
+			if !have[id] {
+				add = append(add, id)
+			}
+		}
+		t.TicketsTags = refsFromTags(add)
+	}
+	if len(in.Performers) > 0 {
+		have := map[int64]bool{}
+		for _, x := range cur.Performers {
+			if x.Performer != nil {
+				have[x.Performer.ID] = true
+			}
+		}
+		ids, err := s.resolvePerformers(ctx, in.Performers, &notes)
+		if err != nil {
+			return nil, notes, err
+		}
+		var add []int64
+		for _, id := range ids {
+			if !have[id] {
+				add = append(add, id)
+			}
+		}
+		t.Performers = refsFromPerformers(add)
+	}
+	if len(in.Attachments) > 0 {
+		atts, err := s.resolveAttachments(ctx, in.Attachments)
+		if err != nil {
+			return nil, notes, err
+		}
+		t.Attachments = atts
+	}
+	t.AttachmentsCount = len(cur.Attachments) + len(t.Attachments)
+	r, err := s.saveTicket(ctx, cur.BoardID, ticketRef{ID: refID, Position: pos, ColumnID: colID, Ticket: t})
+	if err != nil {
+		return nil, notes, err
+	}
+	out := r.TicketRef.Ticket
+	if out.ID == 0 {
+		out.ID = ticketID
+	}
+	return s.reread(ctx, out.ID, &out), notes, nil
+}
+
+// boardColumn колонка вместе со ссылкой «доска — колонка». Id ссылки нужен
+// действиям MoveColumn и RemoveColumn, Id самой колонки — UpdateColumnConfig.
+type boardColumn struct {
+	RefID  int64
+	Index  int
+	Column Column
+}
+
+// boardColumns читает активные колонки доски в порядке слева направо.
+func (s *Service) boardColumns(ctx context.Context, boardID int64) ([]boardColumn, error) {
+	var bc struct {
+		Columns []struct {
+			ID          int64  `json:"Id"`
+			IndexColumn int    `json:"IndexColumn"`
+			Column      Column `json:"Column"`
+		} `json:"Columns"`
+	}
+	if err := s.c.Get(ctx, "IBoards", boardID, odata.Query{
+		Select: "Id", Expand: "Columns($select=Id,IndexColumn;$expand=Column($select=Id,Name,IsFinal,WipLimit,Status))",
+	}, &bc); err != nil {
+		return nil, fmt.Errorf("колонки доски #%d: %w", boardID, err)
+	}
+	var out []boardColumn
+	for _, c := range bc.Columns {
+		if c.Column.Status != "" && c.Column.Status != "Active" {
+			continue
+		}
+		out = append(out, boardColumn{RefID: c.ID, Index: c.IndexColumn, Column: c.Column})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Index < out[j].Index })
+	return out, nil
+}
+
+// ColumnInput описывает новую колонку.
+type ColumnInput struct {
+	Board    string // имя доски или её Id
+	Name     string
+	Position int  // место слева направо с единицы; 0 = перед финальными колонками в конце доски
+	IsFinal  bool // карточки в финальной колонке считаются закрытыми
+	WipLimit int  // 0 = без лимита
+}
+
+// CreateColumn добавляет колонку на доску. Платформа создаёт её в конце доски
+// с именем «Новая колонка» (AgileBoards/CreateColumn), имя, признак финальной
+// и лимит задаются вторым действием (UpdateColumnConfig), место — третьим
+// (MoveColumn, позиции считаются с нуля). Возвращает место колонки с единицы.
+func (s *Service) CreateColumn(ctx context.Context, in ColumnInput) (*Board, *Column, int, Notes, error) {
+	var notes Notes
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		return nil, nil, 0, notes, errors.New("нужно название колонки")
+	}
+	b, err := s.ResolveBoard(ctx, in.Board)
+	if err != nil {
+		return nil, nil, 0, notes, err
+	}
+	cols, err := s.boardColumns(ctx, b.ID)
+	if err != nil {
+		return b, nil, 0, notes, err
+	}
+	for _, c := range cols {
+		if strings.EqualFold(strings.TrimSpace(c.Column.Name), name) {
+			return b, nil, 0, notes, fmt.Errorf("на доске уже есть колонка «%s» (#%d)", c.Column.Name, c.Column.ID)
+		}
+	}
+	// Без явного места обычная колонка встаёт перед «Выполнено» и другими
+	// финальными в конце доски: колонка после финальной почти никогда не нужна.
+	target := len(cols)
+	if in.Position > 0 {
+		target = min(in.Position-1, len(cols))
+	} else if !in.IsFinal {
+		for target > 0 && cols[target-1].Column.IsFinal {
+			target--
+		}
+	}
+	data, err := s.c.Action(ctx, "AgileBoards", "CreateColumn", map[string]any{"appId": appID, "boardId": b.ID})
+	if err != nil {
+		return b, nil, 0, notes, err
+	}
+	var cr struct {
+		RefID int64 `json:"newColumnRefId"`
+		ID    int64 `json:"newColumnId"`
+		Index int   `json:"indexColumn"`
+	}
+	if err := json.Unmarshal(data, &cr); err != nil || cr.ID == 0 || cr.RefID == 0 {
+		return b, nil, 0, notes, errors.New("ответ доски на создание колонки не разобран; проверьте доску, там может остаться «Новая колонка»")
+	}
+	var wip any // nil = без лимита
+	if in.WipLimit > 0 {
+		wip = in.WipLimit
+	}
+	if _, err := s.c.Action(ctx, "AgileBoards", "UpdateColumnConfig", map[string]any{
+		"appId": appID, "columnId": cr.ID, "name": name, "isFinal": in.IsFinal, "idleDaysColumn": nil, "wipLimit": wip,
+	}); err != nil {
+		// Безымянная «Новая колонка» хуже, чем никакой: убираем её.
+		if _, e := s.c.Action(ctx, "AgileBoards", "RemoveColumn", map[string]any{"appId": appID, "boardId": b.ID, "columnRefId": cr.RefID}); e != nil {
+			return b, nil, 0, notes, fmt.Errorf("колонка создана, но не настроена (%v), и убрать её не вышло (%v): удалите «Новая колонка» в интерфейсе доски", err, e)
+		}
+		return b, nil, 0, notes, fmt.Errorf("колонку не удалось настроить, создание отменено: %w", err)
+	}
+	pos := cr.Index
+	if target != cr.Index {
+		if _, err := s.c.Action(ctx, "AgileBoards", "MoveColumn", map[string]any{
+			"appId": appID, "boardId": b.ID, "columnRefId": cr.RefID, "position": target,
+		}); err != nil {
+			notes.add("колонка создана, но осталась в конце доски: переставить не вышло (%v)", err)
+		} else {
+			pos = target
+		}
+	}
+	col := &Column{ID: cr.ID, Name: name, IsFinal: in.IsFinal, Status: "Active"}
+	if in.WipLimit > 0 {
+		w := in.WipLimit
+		col.WipLimit = &w
+	}
+	return b, col, pos + 1, notes, nil
+}
+
+// TicketsByIDs читает карточки по Id в том порядке, в каком их передали; повторы убираются.
+func (s *Service) TicketsByIDs(ctx context.Context, ids []int64) ([]Ticket, error) {
+	seen := map[int64]bool{}
+	var out []Ticket
+	for _, id := range ids {
+		if id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		t, err := s.TicketByID(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("карточка #%d: %w", id, err)
+		}
+		out = append(out, *t)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("не указаны карточки")
+	}
+	return out, nil
+}
+
+// RemovedTickets итог удаления карточек с досок.
+type RemovedTickets struct {
+	Removed    []Ticket
+	Blocked    []Ticket // платформа не дала снять, обычно карточку держит блокировка
+	NotOnBoard []Ticket // на доске карточки уже нет
+	Warnings   []string
+}
+
+// RemoveTickets удаляет карточки с досок действием AgileBoards/RemoveTickets
+// (оно же стоит за удалением в интерфейсе доски). Действие принимает не Id
+// карточек, а Id их ссылок на колонки, поэтому ссылки сначала находим по доске;
+// у одной карточки их бывает несколько, снимаются все.
+func (s *Service) RemoveTickets(ctx context.Context, ts []Ticket) (*RemovedTickets, error) {
+	out := &RemovedTickets{}
+	byBoard := map[int64][]Ticket{}
+	var boards []int64
+	for _, t := range ts {
+		if _, ok := byBoard[t.BoardID]; !ok {
+			boards = append(boards, t.BoardID)
+		}
+		byBoard[t.BoardID] = append(byBoard[t.BoardID], t)
+	}
+	for _, bid := range boards {
+		refs, err := s.ticketRefs(ctx, bid)
+		if err != nil {
+			return out, err
+		}
+		owner := map[int64]int64{} // ссылка → карточка
+		var refIDs []int64
+		var here []Ticket
+		for _, t := range byBoard[bid] {
+			rs := refs[t.ID]
+			if len(rs) == 0 {
+				out.NotOnBoard = append(out.NotOnBoard, t)
+				continue
+			}
+			here = append(here, t)
+			for _, r := range rs {
+				owner[r] = t.ID
+				refIDs = append(refIDs, r)
+			}
+		}
+		if len(refIDs) == 0 {
+			continue
+		}
+		data, err := s.c.Action(ctx, "AgileBoards", "RemoveTickets", map[string]any{
+			"appId": appID, "boardId": bid, "ticketRefIds": refIDs,
+		})
+		if err != nil {
+			return out, fmt.Errorf("доска #%d: %w", bid, err)
+		}
+		var rr struct {
+			Blocked []int64 `json:"blockedTicketRefIds"`
+			Warning string  `json:"warning"`
+		}
+		_ = json.Unmarshal(data, &rr) // пустой ответ = всё снято
+		blocked := map[int64]bool{}
+		for _, r := range rr.Blocked {
+			blocked[owner[r]] = true
+		}
+		for _, t := range here {
+			if blocked[t.ID] {
+				out.Blocked = append(out.Blocked, t)
+			} else {
+				out.Removed = append(out.Removed, t)
+			}
+		}
+		if w := strings.TrimSpace(rr.Warning); w != "" {
+			out.Warnings = append(out.Warnings, w)
+		}
+	}
+	return out, nil
+}
+
+// ticketRefs собирает ссылки карточек на колонки доски: карточка → её ссылки.
+func (s *Service) ticketRefs(ctx context.Context, boardID int64) (map[int64][]int64, error) {
+	page, err := s.c.List(ctx, "IColumns", odata.Query{
+		Filter: fmt.Sprintf("BoardId eq %d and Status eq 'Active'", boardID),
+		Select: "Id", Expand: "Tickets($select=Id;$expand=Ticket($select=Id))", Top: 50,
+	})
+	if err != nil {
+		return nil, err
+	}
+	cols, err := decodeList[Column](page)
+	if err != nil {
+		return nil, err
+	}
+	out := map[int64][]int64{}
+	for _, c := range cols {
+		for _, t := range c.Tickets {
+			if t.Ticket != nil && t.ID != 0 {
+				out[t.Ticket.ID] = append(out[t.Ticket.ID], t.ID)
+			}
+		}
+	}
+	return out, nil
+}
