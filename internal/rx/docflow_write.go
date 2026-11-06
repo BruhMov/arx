@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 )
@@ -145,28 +146,116 @@ func (s *Service) UpdateArticle(ctx context.Context, id int64, title, text strin
 	return nil
 }
 
-// CreateSimpleDocument создаёт карточку простого документа (SimpleDocument) через OData.
-// Возвращает Id созданного документа.
-func (s *Service) CreateSimpleDocument(ctx context.Context, name string) (int64, error) {
-	body := map[string]any{
-		"Name": name,
+// Набор сущности eTMF-документа в сервисе интеграции. Имя набора и имена свойств
+// берутся из решения eTMF (клинические исследования) и на стендах могут отличаться:
+// набор переопределяется переменной окружения RXMCP_ETMF_SET, имена свойств — прямо
+// в body() ниже. Имена своего стенда можно посмотреть через rx_find_entity и
+// rx_describe_entity (набор $metadata).
+const etmfSetDefault = "IEtmfDocuments"
+
+func etmfSet() string {
+	if v := strings.TrimSpace(os.Getenv("RXMCP_ETMF_SET")); v != "" {
+		return v
 	}
-	
-	// "ISimpleDocuments" is the OData entity set for SimpleDocument interfaces.
-	// Метод Create автоматически добавляет заголовки Content-Type и Accept.
-	data, err := s.c.Create(ctx, "ISimpleDocuments", body)
+	return etmfSetDefault
+}
+
+// EtmfDocumentInput поля карточки eTMF-документа, заполняемые при создании.
+// Ссылки передаются Id: объект, на который идёт ссылка, уже должен существовать
+// в системе. Дата создания, имя исследования и состояние жизненного цикла
+// (Состояние, Согласование, Этап исследования) проставляет сам RX — их в теле
+// запроса не передаём.
+type EtmfDocumentInput struct {
+	Name                 string    // Имя
+	ArtifactID           int64     // Артефакт
+	Version              string    // Версия
+	ZoneID               int64     // Зона (01. Управление исследованием и т.д.)
+	SectionID            int64     // Секция (Команда исследования и т.д.)
+	EffectiveDate        time.Time // Дата введения в действие
+	ICHCode              string    // Код ICH (5.6 и т.д.)
+	StudyTypeID          int64     // Тип исследования
+	SponsorDocument      bool      // флажок «Sponsor Document»
+	InvestigatorDocument bool      // флажок «Investigator Document»
+	ProcessID            int64     // Процесс
+	ProcessNumber        string    // Номер процесса
+	StudyID              int64     // ИД исследования
+	PhaseID              int64     // Фаза исследования
+	CountryID            int64     // Страна
+	CenterID             int64     // Центр (площадка)
+	OurOrgID             int64     // Наша организация
+	DepartmentID         int64     // Подразделение
+	AuthorID             int64     // Автор; 0 = текущий пользователь
+	SignatoryID          int64     // Подписант
+}
+
+// body собирает тело POST-запроса: имя и только заполненные поля. Ссылочные
+// свойства заполняются объектом {"Id": …}, как того требует сервис интеграции.
+func (in EtmfDocumentInput) body(loc *time.Location) map[string]any {
+	b := map[string]any{"Name": in.Name}
+	for k, v := range map[string]string{
+		"Version":       in.Version,
+		"ICHCode":       in.ICHCode,
+		"ProcessNumber": in.ProcessNumber,
+	} {
+		if v = strings.TrimSpace(v); v != "" {
+			b[k] = v
+		}
+	}
+	for k, id := range map[string]int64{
+		"Artifact":   in.ArtifactID,
+		"Zone":       in.ZoneID,
+		"Section":    in.SectionID,
+		"StudyType":  in.StudyTypeID,
+		"Process":    in.ProcessID,
+		"Study":      in.StudyID,
+		"Phase":      in.PhaseID,
+		"Country":    in.CountryID,
+		"Center":     in.CenterID,
+		"OurOrg":     in.OurOrgID,
+		"Department": in.DepartmentID,
+		"Author":     in.AuthorID,
+		"Signatory":  in.SignatoryID,
+	} {
+		if id != 0 {
+			b[k] = map[string]any{"Id": id}
+		}
+	}
+	if in.SponsorDocument {
+		b["SponsorDocument"] = true
+	}
+	if in.InvestigatorDocument {
+		b["InvestigatorDocument"] = true
+	}
+	if !in.EffectiveDate.IsZero() {
+		// Поля-даты RX хранит полночью в поясе сервера: пишем так же,
+		// иначе день может сдвинуться на сутки.
+		d := in.EffectiveDate
+		b["EffectiveDate"] = time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, loc).Format(time.RFC3339)
+	}
+	return b
+}
+
+// CreateEtmfDocument создаёт карточку eTMF-документа (EtmfDocument) через OData
+// и возвращает Id созданного документа. Заголовки Content-Type и Accept клиент
+// OData проставляет сам; ответ приходит с созданной сущностью, из него берётся Id.
+func (s *Service) CreateEtmfDocument(ctx context.Context, in EtmfDocumentInput) (int64, error) {
+	in.Name = strings.TrimSpace(in.Name)
+	if in.Name == "" {
+		return 0, errors.New("нужно имя eTMF-документа")
+	}
+	loc := s.F.Loc
+	if loc == nil {
+		loc = time.UTC
+	}
+	data, err := s.c.Create(ctx, etmfSet(), in.body(loc))
 	if err != nil {
-		return 0, fmt.Errorf("создание документа: %w", err)
+		return 0, fmt.Errorf("создание eTMF-документа: %w", err)
 	}
-
-	var created map[string]any
-	if err := json.Unmarshal(data, &created); err != nil {
-		return 0, fmt.Errorf("разбор ответа RX: %w", err)
+	var created struct {
+		ID int64 `json:"Id"`
 	}
-
-	// OData возвращает Id созданной сущности в теле ответа (так как мы не отправляли Return: minimal).
-	if idVal, ok := created["Id"].(float64); ok {
-		return int64(idVal), nil
+	if err := json.Unmarshal(data, &created); err != nil || created.ID == 0 {
+		return 0, errors.New("eTMF-документ создан, но Id из ответа не разобран")
 	}
-	return 0, fmt.Errorf("RX не вернул Id созданного документа")
+	return created.ID, nil
 }

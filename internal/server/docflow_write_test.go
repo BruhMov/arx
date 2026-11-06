@@ -35,6 +35,8 @@ func TestDocflowWrite(t *testing.T) {
 			w.WriteHeader(204)
 		case "IMemoArticles":
 			json.NewEncoder(w).Encode(map[string]any{"Id": 77, "Name": "Как выпустить релиз"})
+		case "IEtmfDocuments":
+			json.NewEncoder(w).Encode(map[string]any{"Id": 2001, "Name": "План управления исследованием"})
 		case "MemoRX/CreateMemoVersion":
 			if versionFails {
 				http.Error(w, `{"value":"нет лицензии"}`, 400)
@@ -110,6 +112,63 @@ func TestDocflowWrite(t *testing.T) {
 		t.Errorf("правка статьи: %s", out)
 	}
 
+	out, isErr = call("rx_create_etmf_document", map[string]any{
+		"name":                  "План управления исследованием (Trial Management Plan) 17.09.2026 Нейро-Когнитив-Фаза I",
+		"version":               "1",
+		"zone_id":               3,
+		"section_id":            5,
+		"effective_date":        "2026-08-23",
+		"ich_code":              "5.6",
+		"study_type_id":         7,
+		"sponsor_document":      true,
+		"investigator_document": false,
+		"process_id":            9,
+		"process_number":        "12",
+		"study_id":              102,
+		"phase_id":              4,
+		"country_id":            1,
+		"center_id":             11,
+		"our_org_id":            2,
+		"department_id":         6,
+		"author_id":             8,
+		"signatory_id":          3,
+	})
+	e := calls["IEtmfDocuments"]
+	if isErr || e["Name"] != "План управления исследованием (Trial Management Plan) 17.09.2026 Нейро-Когнитив-Фаза I" {
+		t.Errorf("eTMF: %s %v", out, e)
+	}
+	if e["Version"] != "1" || e["ICHCode"] != "5.6" || e["ProcessNumber"] != "12" || e["EffectiveDate"] != "2026-08-23T00:00:00Z" {
+		t.Errorf("eTMF простые поля: %s %v", out, e)
+	}
+	ref := func(name string) float64 {
+		if m, ok := e[name].(map[string]any); ok {
+			return m["Id"].(float64)
+		}
+		return 0
+	}
+	if ref("Zone") != 3 || ref("Section") != 5 || ref("StudyType") != 7 || ref("Process") != 9 || ref("Study") != 102 || ref("Phase") != 4 || ref("Country") != 1 || ref("Center") != 11 || ref("OurOrg") != 2 || ref("Department") != 6 || ref("Author") != 8 || ref("Signatory") != 3 {
+		t.Errorf("eTMF ссылки: %s %v", out, e)
+	}
+	if e["SponsorDocument"] != true || e["InvestigatorDocument"] != nil { // false не передаём
+		t.Errorf("eTMF флажки: %s %v", out, e)
+	}
+	if !strings.Contains(out, "#2001") {
+		t.Errorf("eTMF ответ без Id: %s", out)
+	}
+
+	// Только имя: в теле не должно быть ни ссылок, ни дат, ни флажков.
+	out, isErr = call("rx_create_etmf_document", map[string]any{"name": "Информированное согласие"})
+	e = calls["IEtmfDocuments"]
+	if isErr || len(e) != 1 || e["Name"] != "Информированное согласие" {
+		t.Errorf("eTMF минимальная карточка: %s %v", out, e)
+	}
+	if _, isErr = call("rx_create_etmf_document", map[string]any{"name": ""}); !isErr {
+		t.Error("eTMF без имени должно отклоняться")
+	}
+	if _, isErr = call("rx_create_etmf_document", map[string]any{"name": "x", "effective_date": "вчера"}); !isErr {
+		t.Error("eTMF с кривой датой должно отклоняться")
+	}
+
 	if out, isErr = call("rx_complete_assignment", map[string]any{"id": 9}); !isErr || !strings.Contains(out, "подпись") {
 		t.Errorf("подписание должно отклоняться: %s", out)
 	}
@@ -119,7 +178,7 @@ func TestDocflowWrite(t *testing.T) {
 	}
 
 	ro := toolNames(t, connect(t, false, srv.URL+"/odata"))
-	for _, n := range []string{"rx_send_for_acquaintance", "rx_send_for_approval", "rx_create_article", "rx_update_article"} {
+	for _, n := range []string{"rx_send_for_acquaintance", "rx_send_for_approval", "rx_create_article", "rx_update_article", "rx_create_etmf_document"} {
 		if _, ok := ro[n]; ok {
 			t.Errorf("%s виден без RXMCP_ALLOW_WRITE", n)
 		}
