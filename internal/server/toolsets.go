@@ -18,7 +18,7 @@ var toolsets = map[string][]string{
 		"rx_whoami", "rx_my_assignments", "rx_get_assignment", "rx_list_tasks", "rx_get_task",
 		"rx_find_documents", "rx_get_document", "rx_get_document_text", "rx_find_employees", "rx_whats_new",
 		"rx_complete_assignment", "rx_create_simple_task", "rx_abort_task",
-		"rx_send_for_acquaintance", "rx_send_for_approval","rx_create_document",
+		"rx_send_for_acquaintance", "rx_send_for_approval", "rx_create_etmf_document",
 	},
 	"boards": {
 		"rx_boards", "rx_board", "rx_tickets", "rx_ticket", "rx_ticket_file", "rx_ticket_relations", "rx_ticket_history",

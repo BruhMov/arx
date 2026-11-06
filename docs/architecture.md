@@ -93,6 +93,8 @@ MCP-сервер для Directum RX. Даёт ИИ-ассистенту (Claude 
 
 Это запасной выход для данных, под которые нет готового инструмента. Имя набора проверяется на допустимые символы, список ограничен ста записями, ответ обрезается по общему лимиту текста. Запись сюда не входит: с флагом записи добавляется только `rx_call_action`, вызов действия модуля с подтверждением. Создавать, менять и удалять произвольные сущности сервер не умеет.
 
+Словарь русских корней в `internal/catalog/catalog.go` покрывает и лексику клинических исследований (eTMF): зоны, секции, артефакты, исследования, испытания, фазы, центры. Так «зоны etmf» находит `IEtmfZones`, а «исследования» — наборы `IStudies`/`ITrials`, и помощник сам собирает Id справочников для `rx_create_etmf_document`.
+
 ### Инструменты записи (только с `RXMCP_ALLOW_WRITE=1`)
 
 Без флага эти инструменты не регистрируются вовсе: модель их не видит и не может вызвать.
@@ -104,6 +106,7 @@ MCP-сервер для Directum RX. Даёт ИИ-ассистенту (Claude 
 | `rx_abort_task` | прекратить задачу | `POST Shell/AbortTask` |
 | `rx_send_for_acquaintance` | отправить документ на ознакомление | `POST RecordManagement/CreateAcquaintanceTask`, затем `Docflow/StartTask`: действие только сохраняет черновик |
 | `rx_send_for_approval` | свободное согласование или по регламенту | `POST Docflow/CreateFreeApprovalTask` или `CreateApprovalTask` (маршрут по правилу RX, указанные люди сверх правила), затем `Docflow/StartTask` |
+| `rx_create_etmf_document` | карточка eTMF-документа со всеми полями из запроса | `POST IEtmfDocuments` (набор меняется через `RXMCP_ETMF_SET`): имя, версия, код ICH, номер процесса и дата введения в действие — значениями, артефакт, зона, секция, тип исследования, процесс, исследование, фаза, страна, центр, наша орг., подразделение, автор и подписант — ссылками `{"Id": …}`, флажки спонсора и исследователя — true. Дата создания, имя исследования и состояние жизненного цикла проставляет сам RX. Имена свойств решения eTMF собраны в одном месте — `EtmfDocumentInput.body()` в `internal/rx/docflow_write.go`; сверить их со своим стендом можно через `rx_describe_entity` |
 | `rx_create_article`, `rx_update_article` | статья базы знаний: создать в области, изменить название и текст | `POST IMemoArticles` с `Areas`, `MemoRX/CreateMemoVersion`; `MemoRX/UpdateArticleTitle`. Если текст не записался, пустая статья убирается `MemoRX/DeleteEmptyArticleById` |
 | `rx_create_ticket`, `rx_update_ticket` | завести карточку; изменить, перенести, добавить вложения | `POST AgileBoards/SaveTicket`; вложение это запись «название и адрес» со `State: Added`. Файл сначала уходит в `AgileBoards/UploadPersistedBinaryData` (base64) и получает адрес `storage://<Id>&<тип>`, документ RX прикладывается гиперссылкой `Sungero?type=…&id=…` |
 | `rx_comment_ticket` | добавить комментарий к карточке; читает комментарии `rx_ticket` | `POST TeamsCommonAPI/CreateComment` и `LoadComments`: кроме Id карточки и доски нужны идентификаторы их типов, они зашиты в `internal/rx/comments.go` и заменяются через `RXMCP_TICKET_TYPE_GUID`, `RXMCP_BOARD_TYPE_GUID` |

@@ -115,6 +115,10 @@ var ru = map[string][]string{
 	"согласован": {"approval"}, "правил": {"rule"}, "доск": {"board"}, "карточк": {"ticket"}, "стать": {"article"}, "контакт": {"contact"},
 	"наша": {"businessunit"}, "группа": {"group", "role"}, "дел": {"casefile"}, "номенклатур": {"casefile"}, "инструкц": {"memo", "document"},
 	"служебн": {"memo"}, "записк": {"memo"}, "входящ": {"incoming"}, "исходящ": {"outgoing"}, "накладн": {"waybill"}, "упд": {"universaltransfer"},
+	// клинические исследования (eTMF): зоны, секции, артефакты, исследования, фазы, центры.
+	// Корни обрезаны, как у остальных: IStudies содержит «studi», но не «study».
+	"зон": {"zone"}, "секц": {"section"}, "артефакт": {"artifact"}, "исследован": {"studi", "trial"}, "испытан": {"trial", "studi"},
+	"фаз": {"phase"}, "центр": {"site", "center"},
 }
 
 func words(q string) []string {
