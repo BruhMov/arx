@@ -11,6 +11,7 @@ import (
 	"github.com/drxinfra/rxmcp/internal/odata"
 	"github.com/drxinfra/rxmcp/internal/rx"
 	"github.com/drxinfra/rxmcp/internal/server"
+	"github.com/drxinfra/rxmcp/internal/studio"
 )
 
 func connectTools(t *testing.T, spec string) (*mcp.ClientSession, *mcp.InitializeResult) {
@@ -26,7 +27,10 @@ func connectTools(t *testing.T, spec string) (*mcp.ClientSession, *mcp.Initializ
 	svc := rx.New(cl, "ivanov", 0, 20, 100, rx.Formatter{Loc: time.UTC})
 	help := &server.HelpSource{Path: t.TempDir() + "/help.idx.gz", Base: "https://rx.example/Client/WebHelp/ru-RU",
 		Fetch: func(context.Context, string) ([]byte, string, error) { return nil, "", context.Canceled }}
-	s := server.New(svc, server.Options{Version: "test", AllowWrite: true, NoConfirm: true, MaxTextChars: 20000, OData: cl, Help: help, Tools: tools})
+	// Studio подключаем как настроенную, но без реального соединения (New не дозванивается):
+	// так инструменты dev_* регистрируются и попадают в набор studio.
+	s := server.New(svc, server.Options{Version: "test", AllowWrite: true, NoConfirm: true, MaxTextChars: 20000, OData: cl, Help: help, Tools: tools,
+		Studio: studio.New("ws://127.0.0.1:1/rpc", time.Second, time.Minute), StudioAllowDeploy: true})
 	ct, st := mcp.NewInMemoryTransports()
 	if _, err := s.MCP.Connect(context.Background(), st, nil); err != nil {
 		t.Fatal(err)

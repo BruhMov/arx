@@ -16,6 +16,7 @@ import (
 
 	"github.com/drxinfra/rxmcp/internal/odata"
 	"github.com/drxinfra/rxmcp/internal/rx"
+	"github.com/drxinfra/rxmcp/internal/studio"
 	"github.com/drxinfra/rxmcp/internal/textx"
 )
 
@@ -33,6 +34,10 @@ type Options struct {
 	Host         string          // хост RX: в названии и описании сервера, чтобы помощник различал системы
 	User         string          // HTTP-режим с персональными учётками: кто вызывает, для журнала
 	Tools        map[string]bool // RXMCP_TOOLS: какие инструменты оставить (ParseTools); nil = все
+	// Development Studio: сервис работы с локальной Studio; nil = инструменты не регистрируются.
+	Studio *studio.Service
+	// Разрешить публикацию и NoCode (RXMCP_STUDIO_ALLOW_DEPLOY).
+	StudioAllowDeploy bool
 }
 
 // Server обёртка над mcp.Server.
@@ -65,6 +70,9 @@ func New(svc *rx.Service, opt Options) *Server {
 		instr = "Система: " + opt.Host + ". Если подключено несколько Directum RX, данные этой системы берите только её инструментами.\n" + instructions
 	}
 	instr = instructionsFor(opt, instr)
+	if opt.Studio != nil && opt.allows("dev_about") {
+		instr += "\n" + studioInstructions(opt)
+	}
 	s.MCP = mcp.NewServer(&mcp.Implementation{
 		Name:       "rxmcp",
 		Title:      title,
@@ -97,6 +105,9 @@ func New(svc *rx.Service, opt Options) *Server {
 		if opt.OData != nil {
 			s.registerCatalogWrite()
 		}
+	}
+	if opt.Studio != nil {
+		s.registerStudio()
 	}
 	s.applyToolsets()
 	s.registerResources()

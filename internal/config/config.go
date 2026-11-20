@@ -77,6 +77,14 @@ type Config struct {
 	// результат кладёт в ToolSet тот, кто создаёт сервер.
 	Tools   string
 	ToolSet map[string]bool
+	// Directum Development Studio: WebSocket-адрес локального приложения разработчика.
+	// Пусто = инструменты Studio не регистрируются.
+	StudioURL string
+	// Таймаут обычного RPC-вызова к Studio и отдельный — для публикации (идёт минуты).
+	StudioTimeout       time.Duration
+	StudioDeployTimeout time.Duration
+	// Разрешить публикацию и применение NoCode-настроек (необратимо и медленно).
+	StudioAllowDeploy bool
 }
 
 // HelpBase адрес каталога справки на стенде. По умолчанию справка лежит рядом с веб-клиентом:
@@ -139,6 +147,10 @@ func FromEnv() (*Config, error) {
 		UpdateCheck:      !isFalse(get("RXMCP_UPDATE_CHECK")),
 		Secrets:          secret.Normalize(get("RXMCP_SECRETS")),
 		Tools:            get("RXMCP_TOOLS"),
+		StudioURL:        strings.TrimRight(get("RXMCP_STUDIO_URL"), "/"),
+		StudioTimeout:    30 * time.Second,
+		StudioDeployTimeout: 10 * time.Minute,
+		StudioAllowDeploy: isTrue(get("RXMCP_STUDIO_ALLOW_DEPLOY")),
 	}
 	if v := get("RXMCP_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -146,6 +158,20 @@ func FromEnv() (*Config, error) {
 			return nil, fmt.Errorf("RXMCP_TIMEOUT: %w", err)
 		}
 		c.Timeout = d
+	}
+	if v := get("RXMCP_STUDIO_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("RXMCP_STUDIO_TIMEOUT: %w", err)
+		}
+		c.StudioTimeout = d
+	}
+	if v := get("RXMCP_STUDIO_DEPLOY_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("RXMCP_STUDIO_DEPLOY_TIMEOUT: %w", err)
+		}
+		c.StudioDeployTimeout = d
 	}
 	if v := get("RXMCP_OIDC_PORT"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -231,6 +257,12 @@ func (c *Config) Validate() error {
 		}
 	default:
 		return fmt.Errorf("RXMCP_HTTP_AUTH=%q: допустимо secret или oidc", c.HTTPAuth)
+	}
+	if c.StudioURL != "" && !strings.HasPrefix(c.StudioURL, "ws://") && !strings.HasPrefix(c.StudioURL, "wss://") {
+		return errors.New("RXMCP_STUDIO_URL должен начинаться с ws:// или wss:// (например ws://127.0.0.1:8362/rpc)")
+	}
+	if c.StudioAllowDeploy && c.StudioURL == "" {
+		return errors.New("RXMCP_STUDIO_ALLOW_DEPLOY требует RXMCP_STUDIO_URL")
 	}
 	return nil
 }

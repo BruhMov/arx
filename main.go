@@ -30,6 +30,7 @@ import (
 	"github.com/drxinfra/rxmcp/internal/rx"
 	"github.com/drxinfra/rxmcp/internal/secret"
 	"github.com/drxinfra/rxmcp/internal/server"
+	"github.com/drxinfra/rxmcp/internal/studio"
 	"github.com/drxinfra/rxmcp/internal/weblogin"
 )
 
@@ -87,8 +88,13 @@ const usage = `rxmcp %s: MCP-сервер для Directum RX (drxinfra.ru/rxmcp)
   RXMCP_HTTP_ADDR     адрес для serve --http, например 127.0.0.1:8765
   RXMCP_HTTP_SECRET   общий секрет для HTTP-режима, клиент шлёт Authorization: Bearer <секрет>
   RXMCP_SECRETS       file (по умолчанию, файлы 0600) | keyring (связка ключей ОС); менять командой rxmcp secrets
-  RXMCP_TOOLS         наборы инструментов через запятую: core (всегда), boards, projects, kb, help, catalog;
-                      по умолчанию все. Пример: RXMCP_TOOLS=boards,kb (для малых локальных моделей)
+  RXMCP_TOOLS         наборы инструментов через запятую: core (всегда), boards, projects, kb, help, catalog,
+                      studio; по умолчанию все. Пример: RXMCP_TOOLS=boards,kb (для малых локальных моделей)
+  RXMCP_STUDIO_URL    адрес Development Studio (WebSocket), например ws://127.0.0.1:8362/rpc;
+                      пусто = инструменты Studio (dev_*) не регистрируются
+  RXMCP_STUDIO_TIMEOUT      таймаут обычного RPC-вызова к Studio, по умолчанию 30s
+  RXMCP_STUDIO_DEPLOY_TIMEOUT  таймаут публикации, по умолчанию 10m
+  RXMCP_STUDIO_ALLOW_DEPLOY 1 = разрешить dev_publish и dev_apply_nocode (необратимо, медленно)
   RXMCP_UPDATE_CHECK  0 = не узнавать о новых версиях (по умолчанию раз в сутки спрашивает
                       drxinfra.ru/dl/rxmcp/latest.txt, при недоступности GitHub; больше ничего не шлёт)
 `
@@ -224,6 +230,14 @@ func build() (*config.Config, *rx.Service, error) {
 	f := rx.Formatter{Loc: cfg.Location()}
 	svc := rx.New(cl, cfg.Login, cfg.UserID, cfg.PageSize, cfg.MaxPageSize, f)
 	return cfg, svc, nil
+}
+
+// newStudio собирает сервис Development Studio, если задан RXMCP_STUDIO_URL.
+func newStudio(cfg *config.Config) *studio.Service {
+	if cfg.StudioURL == "" {
+		return nil
+	}
+	return studio.New(cfg.StudioURL, cfg.StudioTimeout, cfg.StudioDeployTimeout)
 }
 
 func oidcConfig(cfg *config.Config) *auth.OIDCConfig {
@@ -512,7 +526,7 @@ func serve(httpMode bool) error {
 		return err
 	}
 	srv := server.New(svc, server.Options{Version: version, AllowWrite: cfg.AllowWrite, NoConfirm: !cfg.Confirm, MaxTextChars: cfg.MaxTextChars, Logger: log, Help: helpSrc, OData: helpClient, Tools: cfg.ToolSet,
-		StateDir: auth.Dir(), StateKey: stateKey(cfg), Host: hostOf(cfg.URL)})
+		StateDir: auth.Dir(), StateKey: stateKey(cfg), Host: hostOf(cfg.URL), Studio: newStudio(cfg), StudioAllowDeploy: cfg.StudioAllowDeploy})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	mode := "read-only"

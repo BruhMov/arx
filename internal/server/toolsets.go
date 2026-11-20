@@ -32,6 +32,13 @@ var toolsets = map[string][]string{
 	"kb":      {"rx_kb_areas", "rx_kb_search", "rx_kb_article", "rx_create_article", "rx_update_article"},
 	"help":    {"rx_help_search", "rx_help_topic", "rx_help_toc"},
 	"catalog": {"rx_find_entity", "rx_describe_entity", "rx_query", "rx_call_action"},
+	"studio": {
+		"dev_about", "dev_configurations", "dev_open_development", "dev_tree", "dev_get_metadata",
+		"dev_create_solution", "dev_create_module", "dev_create_databook", "dev_create_item", "dev_add_property",
+		"dev_set_localization", "dev_set_parameter", "dev_save_metadata", "dev_delete_item", "dev_delete_property",
+		"dev_call", "dev_export_package", "dev_save_nocode",
+		"dev_validate", "dev_publish", "dev_apply_nocode",
+	},
 }
 
 // ToolsetNames имена наборов по алфавиту, для справки и сообщений об ошибке.

@@ -148,9 +148,23 @@ Cookie лежит отдельным файлом и перечитываетс�
 
 Плюс ресурсы `rx://assignment/{id}`, `rx://task/{id}`, `rx://document/{id}` и промпты «разбор заданий на сегодня», «краткое содержание документа».
 
+### Development Studio
+
+Если задать `RXMCP_STUDIO_URL` (WebSocket-адрес локальной Development Studio, например `ws://127.0.0.1:8362/rpc`), появляются инструменты `dev_*` для работы с разработкой напрямую по JSON-RPC. Помощник сможет открыть разработку, читать дерево и метаданные, создавать решения, модули, справочники и свойства, а также публиковать разработку в RX.
+
+Чтение: `dev_about`, `dev_configurations`, `dev_open_development`, `dev_tree`, `dev_get_metadata`. Запись (при `RXMCP_ALLOW_WRITE=1`): `dev_create_solution`, `dev_create_module`, `dev_create_databook`, `dev_create_item`, `dev_add_property`, `dev_set_localization`, `dev_set_parameter`, `dev_save_metadata`, `dev_delete_item`, `dev_delete_property`, `dev_call`, `dev_export_package`, `dev_save_nocode`. Публикация (отдельный флаг `RXMCP_STUDIO_ALLOW_DEPLOY=1`): `dev_validate`, `dev_publish`, `dev_apply_nocode`.
+
+```sh
+rxmcp config set RXMCP_STUDIO_URL=ws://127.0.0.1:8362/rpc
+rxmcp config set RXMCP_ALLOW_WRITE=1
+rxmcp config set RXMCP_STUDIO_ALLOW_DEPLOY=1   # разрешить dev_publish и dev_apply_nocode
+```
+
+Studio должна быть запущена, а нужная разработка открыта. Вызовы проверялись на Studio 26.2.0.0066; это внутренний интерфейс Studio, на других версиях возможны расхождения. Создание и сохранение метаданных не публикует изменения в RX — публикация выполняется отдельно через `dev_publish` и применяет всю разработку.
+
 ### Наборы инструментов
 
-По умолчанию видны все инструменты. Если нужна только часть, перечислите наборы в `RXMCP_TOOLS`: `core` (задания, задачи, документы, сотрудники, «что нового»; включён всегда), `boards`, `projects`, `kb`, `help`, `catalog`. Можно добавить и отдельные инструменты по имени.
+По умолчанию видны все инструменты. Если нужна только часть, перечислите наборы в `RXMCP_TOOLS`: `core` (задания, задачи, документы, сотрудники, «что нового»; включён всегда), `boards`, `projects`, `kb`, `help`, `catalog`, `studio`. Можно добавить и отдельные инструменты по имени.
 
 ```sh
 rxmcp config set RXMCP_TOOLS=boards,kb          # задания, документы, доски и база знаний
