@@ -1,10 +1,8 @@
-package studio_test
+package studio
 
 import (
 	"bufio"
 	"context"
-	"crypto/sha1"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"io"
@@ -14,17 +12,16 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/drxinfra/rxmcp/internal/studio"
 )
 
-// fakeStudio отвечает на JSON-RPC по WebSocket: отдаёт результат по имени метода.
+// fakeStudio отвечает на JSON-RPC по WebSocket: отдаёт результат по имени метода
+// и параметрам. Внутренний тест (package studio), чтобы фейком пользовались и тесты сервиса.
 type fakeStudio struct {
 	srv     *httptest.Server
-	respond func(method string) map[string]any
+	respond func(method string, params json.RawMessage) map[string]any
 }
 
-func newFakeStudio(t *testing.T, respond func(string) map[string]any) *fakeStudio {
+func newFakeStudio(t *testing.T, respond func(string, json.RawMessage) map[string]any) *fakeStudio {
 	t.Helper()
 	f := &fakeStudio{respond: respond}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -52,13 +49,8 @@ func (f *fakeStudio) wsURL() string {
 	return "ws" + strings.TrimPrefix(f.srv.URL, "http") + "/rpc"
 }
 
-func acceptKey(key string) string {
-	h := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-	return base64.StdEncoding.EncodeToString(h[:])
-}
-
 // serveFrames читает кадры клиента (маскированные) и отвечает JSON-RPC.
-func serveFrames(br *bufio.Reader, conn net.Conn, respond func(string) map[string]any) {
+func serveFrames(br *bufio.Reader, conn net.Conn, respond func(string, json.RawMessage) map[string]any) {
 	for {
 		op, payload, err := readFrame(br)
 		if err != nil {
@@ -72,15 +64,16 @@ func serveFrames(br *bufio.Reader, conn net.Conn, respond func(string) map[strin
 			continue
 		}
 		var req struct {
-			ID     int64  `json:"id"`
-			Method string `json:"method"`
+			ID     int64           `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params,omitempty"`
 		}
 		if json.Unmarshal(payload, &req) != nil {
 			return
 		}
 		resp := map[string]any{"jsonrpc": "2.0", "id": req.ID}
 		if respond != nil {
-			if body := respond(req.Method); body != nil {
+			if body := respond(req.Method, req.Params); body != nil {
 				for k, v := range body {
 					resp[k] = v
 				}
@@ -160,7 +153,7 @@ func writeFrame(conn net.Conn, opcode byte, payload []byte) error {
 }
 
 func TestCallResult(t *testing.T) {
-	f := newFakeStudio(t, func(method string) map[string]any {
+	f := newFakeStudio(t, func(method string, _ json.RawMessage) map[string]any {
 		if method == "DevelopmentExplorer/GetDevelopmentTree" {
 			return map[string]any{"result": []map[string]any{{"id": "sol-1", "name": "Решение"}}}
 		}
@@ -168,7 +161,7 @@ func TestCallResult(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	c, err := studio.Dial(ctx, f.wsURL(), 5*time.Second)
+	c, err := Dial(ctx, f.wsURL(), 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -187,12 +180,12 @@ func TestCallResult(t *testing.T) {
 }
 
 func TestCallError(t *testing.T) {
-	f := newFakeStudio(t, func(method string) map[string]any {
+	f := newFakeStudio(t, func(method string, _ json.RawMessage) map[string]any {
 		return map[string]any{"error": map[string]any{"code": -32000, "message": "имя занято"}}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	c, err := studio.Dial(ctx, f.wsURL(), 5*time.Second)
+	c, err := Dial(ctx, f.wsURL(), 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -201,7 +194,7 @@ func TestCallError(t *testing.T) {
 	if err == nil {
 		t.Fatal("ожидалась ошибка")
 	}
-	if !studio.IsRPCError(err) {
+	if !IsRPCError(err) {
 		t.Fatalf("ожидалась RPC-ошибка Studio, получена %v", err)
 	}
 }

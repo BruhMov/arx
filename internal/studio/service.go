@@ -3,11 +3,15 @@ package studio
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 )
+
+// errNoDevelopment возвращают методы, которым нужна открытая разработка.
+var errNoDevelopment = errors.New("разработка не открыта: сначала dev_open_development")
 
 // Service высокоуровневые операции над Development Studio. Держит состояние открытой
 // разработки (developmentId) и прячет многошаговые RPC-последовательности.
@@ -55,10 +59,11 @@ func (s *Service) DevelopmentName() string {
 // call выполняет RPC-метод редактора/сборщика: параметры идут в поле options, а
 // developmentId открытой разработки подставляется отдельным параметром на верхнем уровне.
 func (s *Service) call(ctx context.Context, method string, options map[string]any) (json.RawMessage, error) {
-	params := map[string]any{"options": options}
-	if devID := s.DevelopmentID(); devID != "" {
-		params["developmentId"] = devID
+	devID := s.DevelopmentID()
+	if devID == "" {
+		return nil, errNoDevelopment
 	}
+	params := map[string]any{"options": options, "developmentId": devID}
 	return s.callRaw(ctx, method, params)
 }
 
@@ -70,8 +75,12 @@ func (s *Service) callParams(ctx context.Context, method string, params map[stri
 // callArray выполняет RPC-метод с позиционными параметрами (массивом).
 // Первым элементом автоматически подставляется developmentId.
 func (s *Service) callArray(ctx context.Context, method string, args []any) (json.RawMessage, error) {
+	devID := s.DevelopmentID()
+	if devID == "" {
+		return nil, errNoDevelopment
+	}
 	full := make([]any, 0, len(args)+1)
-	full = append(full, s.DevelopmentID())
+	full = append(full, devID)
 	full = append(full, args...)
 	return s.callRaw(ctx, method, full)
 }
@@ -111,9 +120,9 @@ func (s *Service) opts(extra map[string]any) map[string]any {
 	for k, v := range extra {
 		out[k] = v
 	}
-	if s.devID != "" {
+	if devID := s.DevelopmentID(); devID != "" {
 		if _, ok := out["developmentId"]; !ok {
-			out["developmentId"] = s.devID
+			out["developmentId"] = devID
 		}
 	}
 	return out
@@ -151,13 +160,15 @@ func (s *Service) OpenDevelopment(ctx context.Context, name string) (json.RawMes
 	if err != nil {
 		return nil, fmt.Errorf("OpenDevelopment: %w", err)
 	}
+	// Разработку считаем открытой только после успешной загрузки: при сбое LoadDevelopment
+	// прежнее состояние (в том числе «ничего не открыто») сохраняется.
+	if _, err := s.callParams(ctx, "DevelopmentLifetime/LoadDevelopment", map[string]any{"developmentId": scope}); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	s.devID = scope
 	s.devName = cfgName
 	s.mu.Unlock()
-	if _, err := s.callParams(ctx, "DevelopmentLifetime/LoadDevelopment", map[string]any{"developmentId": scope}); err != nil {
-		return nil, err
-	}
 	return s.Tree(ctx)
 }
 
@@ -165,7 +176,7 @@ func (s *Service) OpenDevelopment(ctx context.Context, name string) (json.RawMes
 func (s *Service) Tree(ctx context.Context) (json.RawMessage, error) {
 	devID := s.DevelopmentID()
 	if devID == "" {
-		return nil, fmt.Errorf("разработка не открыта: сначала dev_open_development")
+		return nil, errNoDevelopment
 	}
 	return s.callParams(ctx, "DevelopmentExplorer/GetDevelopmentTree", map[string]any{"developmentId": devID})
 }
@@ -179,6 +190,9 @@ func (s *Service) FilterTree(ctx context.Context, query string) (json.RawMessage
 // GetDevelopmentConfigurations: {"activeConfigurationName":..., "configurations":[{"name":...}]}.
 func matchConfiguration(raw json.RawMessage, name string) string {
 	lower := strings.ToLower(strings.TrimSpace(name))
+	if lower == "" {
+		return "" // пустой запрос не должен молча матчить первую конфигурацию
+	}
 	var m struct {
 		ActiveConfigurationName string `json:"activeConfigurationName"`
 		Configurations          []struct {
@@ -435,9 +449,9 @@ type PropertyInput struct {
 	DisplayName    map[string]string // локализованное название
 	Length         int               // для String
 	Required       bool
-	DateTimeFormat string            // для DateTime, например Date
-	EntityType     string            // для Navigation: допустимый тип
-	EnumValues     []EnumValueInput  // для Enumeration
+	DateTimeFormat string           // для DateTime, например Date
+	EntityType     string           // для Navigation: допустимый тип
+	EnumValues     []EnumValueInput // для Enumeration
 }
 
 // EnumValueInput вариант перечисления.
@@ -447,9 +461,9 @@ type EnumValueInput struct {
 }
 
 // AddProperty создаёт свойство и настраивает его по описанной последовательности:
-// CreateMetadataElement → ChangeMetadataElementParameter (Name/Code/PropertyType/…)
-// → локализация DisplayName → (варианты перечисления) → SaveMetadata.
-// Возвращает itemId нового свойства.
+// CreateMetadataElement → локализация DisplayName → ChangeMetadataElementParameter
+// (name, code, propertyType, length, isRequired, dateTimeFormat, entityGuid)
+// → (варианты перечисления) → SaveMetadata. Возвращает itemId нового свойства.
 func (s *Service) AddProperty(ctx context.Context, in PropertyInput) (string, error) {
 	adding := in.AddingItemKind
 	if adding == "" {
@@ -469,6 +483,14 @@ func (s *Service) AddProperty(ctx context.Context, in PropertyInput) (string, er
 	if err != nil {
 		return "", err
 	}
+	// Дальнейшие шаги правят уже созданный элемент: при сбое упоминаем itemId,
+	// чтобы полунастроенное свойство можно было найти и удалить (dev_delete_property).
+	setParam := func(param string, value any) error {
+		if err := s.ChangeElementParameter(ctx, in.MetadataType, in.MetadataID, "Property", itemID, param, value); err != nil {
+			return fmt.Errorf("свойство создано (itemId %s), но параметр %s не задан: %w", itemID, param, err)
+		}
+		return nil
+	}
 	// Отображаемое имя обязательно: задаём его по ключу локализации нового свойства.
 	displayName := in.DisplayName
 	if len(displayName) == 0 {
@@ -476,27 +498,52 @@ func (s *Service) AddProperty(ctx context.Context, in PropertyInput) (string, er
 	}
 	if key := propertyDisplayNameKey(raw, itemID); key != "" {
 		if err := s.SetLocalization(ctx, in.MetadataID, in.MetadataType, key, displayName); err != nil {
-			return itemID, err
+			return itemID, fmt.Errorf("свойство создано (itemId %s), но отображаемое имя не задано: %w", itemID, err)
 		}
 	}
 	// Техническое имя и код свойства (по умолчанию автосгенерированы «Property1» и т.п.).
-	if err := s.ChangeElementParameter(ctx, in.MetadataType, in.MetadataID, "Property", itemID, "name", in.Name); err != nil {
+	if err := setParam("name", in.Name); err != nil {
 		return itemID, err
 	}
-	if err := s.ChangeElementParameter(ctx, in.MetadataType, in.MetadataID, "Property", itemID, "code", in.Name); err != nil {
+	code := in.Code
+	if code == "" {
+		code = in.Name
+	}
+	if err := setParam("code", code); err != nil {
 		return itemID, err
 	}
-	// Задаём тип данных свойства (String — по умолчанию, поэтому пропускаем).
-	if pt := in.PropertyType; pt != "" && !strings.EqualFold(pt, "String") {
-		if err := s.ChangeElementParameter(ctx, in.MetadataType, in.MetadataID, "Property", itemID, "propertyType", pt); err != nil {
+	// Тип данных свойства (String — по умолчанию, поэтому не задаём) и зависящие от него параметры.
+	pt := in.PropertyType
+	if pt != "" && !strings.EqualFold(pt, "String") {
+		if err := setParam("propertyType", pt); err != nil {
+			return itemID, err
+		}
+	}
+	if in.Length > 0 && (pt == "" || strings.EqualFold(pt, "String")) {
+		if err := setParam("length", in.Length); err != nil {
+			return itemID, err
+		}
+	}
+	if in.DateTimeFormat != "" && strings.EqualFold(pt, "DateTime") {
+		if err := setParam("dateTimeFormat", in.DateTimeFormat); err != nil {
+			return itemID, err
+		}
+	}
+	if in.EntityType != "" && strings.EqualFold(pt, "Navigation") {
+		if err := setParam("entityGuid", in.EntityType); err != nil {
+			return itemID, err
+		}
+	}
+	if in.Required {
+		if err := setParam("isRequired", true); err != nil {
 			return itemID, err
 		}
 	}
 	// Перечисление — варианты значений.
-	if strings.EqualFold(in.PropertyType, "Enumeration") {
+	if strings.EqualFold(pt, "Enumeration") {
 		for _, ev := range in.EnumValues {
 			if err := s.addEnumValue(ctx, in.MetadataType, in.MetadataID, itemID, in.Name, ev); err != nil {
-				return itemID, err
+				return itemID, fmt.Errorf("свойство создано (itemId %s), но вариант перечисления %q не добавлен: %w", itemID, ev.Name, err)
 			}
 		}
 	}
@@ -581,9 +628,11 @@ func (s *Service) DeleteProperty(ctx context.Context, metadataType, metadataID s
 // GetNavigationEntityTypes допустимые типы для существующего ссылочного свойства.
 func (s *Service) GetNavigationEntityTypes(ctx context.Context, metadataID, metadataType, itemID string) (json.RawMessage, error) {
 	return s.call(ctx, "MetadataEditors/GetNavigationPropertyEntityTypes", map[string]any{
-		"metadataId":    metadataID,
-		"metadataType":  metadataType,
-		"metadataPaths": []any{itemID},
+		"metadataId":   metadataID,
+		"metadataType": metadataType,
+		"metadataPaths": []any{
+			map[string]any{"itemId": itemID, "metadataInnerPartType": "propertyType"},
+		},
 	})
 }
 
@@ -649,7 +698,8 @@ func plainString(raw json.RawMessage) (string, error) {
 }
 
 // guidFromResult достаёт GUID из результата CreateDevelopmentItem.
-func guidFromResult(raw json.RawMessage) (string, error) {	if s, ok := stringFrom(raw, "value"); ok {
+func guidFromResult(raw json.RawMessage) (string, error) {
+	if s, ok := stringFrom(raw, "value"); ok {
 		return s, nil
 	}
 	if s, ok := stringFrom(raw, "id"); ok {

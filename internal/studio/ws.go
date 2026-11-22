@@ -205,6 +205,7 @@ func (w *wsConn) readFrame() (fin bool, opcode byte, payload []byte, err error) 
 }
 
 // readMessage собирает сообщение из кадров, отвечая на ping и close.
+// Суммарный размер сообщения ограничен тем же maxFrame, что и размер кадра.
 func (w *wsConn) readMessage() ([]byte, error) {
 	var msg []byte
 	for {
@@ -214,11 +215,17 @@ func (w *wsConn) readMessage() ([]byte, error) {
 		}
 		switch op {
 		case opText, opBinary:
+			if len(msg)+len(data) > maxFrame {
+				return nil, errors.New("сообщение Studio слишком велико")
+			}
 			msg = append(msg, data...)
 			if fin {
 				return msg, nil
 			}
 		case opContinuation:
+			if len(msg)+len(data) > maxFrame {
+				return nil, errors.New("сообщение Studio слишком велико")
+			}
 			msg = append(msg, data...)
 			if fin {
 				return msg, nil

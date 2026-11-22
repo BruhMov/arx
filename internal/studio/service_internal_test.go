@@ -63,6 +63,9 @@ func TestMatchConfiguration(t *testing.T) {
 	if got := matchConfiguration(raw, "нет такой"); got != "" {
 		t.Errorf("отсутствует = %q", got)
 	}
+	if got := matchConfiguration(raw, "  "); got != "" {
+		t.Errorf("пустой запрос = %q, want пусто (не первая конфигурация)", got)
+	}
 }
 
 func TestFirstBaseType(t *testing.T) {

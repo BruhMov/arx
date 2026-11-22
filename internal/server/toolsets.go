@@ -33,7 +33,7 @@ var toolsets = map[string][]string{
 	"help":    {"rx_help_search", "rx_help_topic", "rx_help_toc"},
 	"catalog": {"rx_find_entity", "rx_describe_entity", "rx_query", "rx_call_action"},
 	"studio": {
-		"dev_about", "dev_configurations", "dev_open_development", "dev_tree", "dev_get_metadata",
+		"dev_about", "dev_configurations", "dev_open_development", "dev_tree", "dev_get_metadata", "dev_get_base_types",
 		"dev_create_solution", "dev_create_module", "dev_create_databook", "dev_create_document", "dev_create_task",
 		"dev_create_assignment", "dev_create_notice", "dev_create_review_assignment", "dev_create_item", "dev_add_property",
 		"dev_set_localization", "dev_set_parameter", "dev_save_metadata", "dev_delete_item", "dev_delete_property",

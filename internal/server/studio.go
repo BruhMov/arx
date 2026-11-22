@@ -29,6 +29,11 @@ type metadataIn struct {
 	MetadataType string `json:"metadata_type" jsonschema:"Solution, Module, Databook, Document, Task, Assignment, Notice или ReviewAssignment"`
 }
 
+type baseTypesIn struct {
+	ParentID     string `json:"parent_id" jsonschema:"GUID родителя: решение для модуля, модуль для справочника/документа/задачи, тип задачи для подтипов"`
+	MetadataType string `json:"metadata_type" jsonschema:"тип создаваемого объекта: Module, Databook, Document, Task, Assignment, Notice или ReviewAssignment"`
+}
+
 func (s *Server) registerStudioRead() {
 	st := s.opt.Studio
 
@@ -88,7 +93,30 @@ func (s *Server) registerStudioRead() {
 		Description: "Прочитать метаданные объекта разработки (решения, модуля, справочника, типа документа/задачи/задания) по его GUID и типу. В ответе ключи ресурсов локализации (DisplayName и др.) и параметры объекта. Только чтение.",
 		Annotations: ro("Метаданные объекта"),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in metadataIn) (*mcp.CallToolResult, any, error) {
-		raw, err := st.GetMetadata(ctx, in.MetadataID, in.MetadataType)
+		mt, err := normalizeMetadataType(in.MetadataType, true)
+		if err != nil {
+			return fail(err)
+		}
+		raw, err := st.GetMetadata(ctx, in.MetadataID, mt)
+		if err != nil {
+			return fail(err)
+		}
+		return text(rawText(raw, s.opt.MaxTextChars)), nil, nil
+	})
+
+	mcp.AddTool(s.MCP, &mcp.Tool{
+		Name:        "dev_get_base_types",
+		Description: "Допустимые базовые типы для нового объекта разработки (DevelopmentBuilders/GetDevelopmentItemBaseTypes): тип по умолчанию и список с GUID. Используйте перед dev_create_item, если нужен нестандартный базовый тип; типовые инструменты dev_create_databook и другие выбирают базовый тип сами. Только чтение.",
+		Annotations: ro("Базовые типы"),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in baseTypesIn) (*mcp.CallToolResult, any, error) {
+		mt, err := normalizeMetadataType(in.MetadataType, true)
+		if err != nil {
+			return fail(err)
+		}
+		if strings.TrimSpace(in.ParentID) == "" {
+			return fail(errors.New("нужен parent_id (родитель, внутри которого создаётся объект)"))
+		}
+		raw, err := st.GetBaseTypes(ctx, in.ParentID, mt)
 		if err != nil {
 			return fail(err)
 		}
@@ -281,7 +309,52 @@ func (s *Server) registerStudioWrite() {
 		if pt == "" {
 			pt = "String"
 		}
+		if pt, err = canonicalPropertyType(pt); err != nil {
+			return fail(err)
+		}
+		switch k := strings.TrimSpace(in.AddingItemKind); k {
+		case "", "Property", "CollectionProperty", "CollectionChildProperty":
+		default:
+			return fail(fmt.Errorf("adding_item_kind %q: допустимо Property (по умолчанию), CollectionProperty или CollectionChildProperty", k))
+		}
+		// Параметры, осмысленные только для своего типа данных, отсекаем сразу,
+		// а не молча пропускаем: агент должен узнать, что настройка не применилась.
+		if len(in.EnumValues) > 0 && pt != "Enumeration" {
+			return fail(fmt.Errorf("enum_values заданы, но property_type %s: варианты бывают только у Enumeration", pt))
+		}
+		for _, ev := range in.EnumValues {
+			if strings.TrimSpace(ev.Name) == "" {
+				return fail(errors.New("у каждого варианта перечисления нужно name"))
+			}
+		}
+		if in.Length > 0 && pt != "String" {
+			return fail(fmt.Errorf("length задан, но property_type %s: длина бывает только у String", pt))
+		}
+		if in.DateTimeFormat != "" && pt != "DateTime" {
+			return fail(fmt.Errorf("datetime_format задан, но property_type %s: формат бывает только у DateTime", pt))
+		}
+		if in.EntityType != "" && pt != "Navigation" {
+			return fail(fmt.Errorf("entity_type задан, но property_type %s: допустимый тип ссылки бывает только у Navigation", pt))
+		}
 		msg := fmt.Sprintf("Добавить свойство «%s» (%s) к %s %s", in.Name, pt, mt, in.MetadataID)
+		if in.Code != "" {
+			msg += fmt.Sprintf(", код %s", in.Code)
+		}
+		if in.Length > 0 {
+			msg += fmt.Sprintf(", длина %d", in.Length)
+		}
+		if in.Required {
+			msg += ", обязательное"
+		}
+		if in.DateTimeFormat != "" {
+			msg += fmt.Sprintf(", формат %s", in.DateTimeFormat)
+		}
+		if in.EntityType != "" {
+			msg += fmt.Sprintf(", тип ссылки %s", in.EntityType)
+		}
+		if n := len(in.EnumValues); n > 0 {
+			msg += fmt.Sprintf(", вариантов перечисления: %d", n)
+		}
 		if ok, err := s.confirm(ctx, req, msg+"?"); err != nil || !ok {
 			return declined(err)
 		}
@@ -310,7 +383,11 @@ func (s *Server) registerStudioWrite() {
 		if ok, err := s.confirm(ctx, req, fmt.Sprintf("Задать название по ключу %s у %s (%d локалей)?", in.Key, in.MetadataID, len(in.Values))); err != nil || !ok {
 			return declined(err)
 		}
-		if err := st.SetLocalization(ctx, in.MetadataID, in.MetadataType, in.Key, in.Values); err != nil {
+		mt, err := normalizeMetadataType(in.MetadataType, true)
+		if err != nil {
+			return fail(err)
+		}
+		if err := st.SetLocalization(ctx, in.MetadataID, mt, in.Key, in.Values); err != nil {
 			return fail(err)
 		}
 		return text(fmt.Sprintf("Название по ключу %s задано (%d локалей). Сохраните: dev_save_metadata.", in.Key, len(in.Values))), nil, nil
@@ -328,7 +405,11 @@ func (s *Server) registerStudioWrite() {
 		if ok, err := s.confirm(ctx, req, fmt.Sprintf("Задать параметр %s = %s у %s?", in.Name, v, in.MetadataID)); err != nil || !ok {
 			return declined(err)
 		}
-		if err := st.SetParameter(ctx, in.MetadataID, in.MetadataType, in.Name, in.Value); err != nil {
+		mt, err := normalizeMetadataType(in.MetadataType, true)
+		if err != nil {
+			return fail(err)
+		}
+		if err := st.SetParameter(ctx, in.MetadataID, mt, in.Name, in.Value); err != nil {
 			return fail(err)
 		}
 		return text(fmt.Sprintf("Параметр %s задан. Сохраните: dev_save_metadata.", in.Name)), nil, nil
@@ -342,10 +423,14 @@ func (s *Server) registerStudioWrite() {
 		if strings.TrimSpace(in.MetadataID) == "" {
 			return fail(errors.New("нужен metadata_id"))
 		}
-		if ok, err := s.confirm(ctx, req, fmt.Sprintf("Сохранить метаданные %s (%s)?", in.MetadataID, in.MetadataType)); err != nil || !ok {
+		mt, err := normalizeMetadataType(in.MetadataType, true)
+		if err != nil {
+			return fail(err)
+		}
+		if ok, err := s.confirm(ctx, req, fmt.Sprintf("Сохранить метаданные %s (%s)?", in.MetadataID, mt)); err != nil || !ok {
 			return declined(err)
 		}
-		if err := st.SaveMetadata(ctx, in.MetadataID, in.MetadataType); err != nil {
+		if err := st.SaveMetadata(ctx, in.MetadataID, mt); err != nil {
 			return fail(err)
 		}
 		return text(fmt.Sprintf("Метаданные %s сохранены.", in.MetadataID)), nil, nil
@@ -607,6 +692,16 @@ func normalizeMetadataType(t string, allowAbstractKinds bool) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("metadata_type %q: допустимо %s", t, strings.Join(allowed, ", "))
+}
+
+// canonicalPropertyType проверяет и приводит тип данных свойства.
+func canonicalPropertyType(t string) (string, error) {
+	for _, a := range []string{"String", "Integer", "Double", "Boolean", "DateTime", "Navigation", "Enumeration", "Collection"} {
+		if strings.EqualFold(t, a) {
+			return a, nil
+		}
+	}
+	return "", fmt.Errorf("property_type %q: допустимо String, Integer, Double, Boolean, DateTime, Navigation, Enumeration или Collection", t)
 }
 
 // studioInstructions правила работы с Development Studio для модели. Учитывают, какие
