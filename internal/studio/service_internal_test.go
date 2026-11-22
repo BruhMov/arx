@@ -74,3 +74,24 @@ func TestFirstBaseType(t *testing.T) {
 		t.Errorf("firstBaseType (без default) = %q", got)
 	}
 }
+
+func TestDisplayNameKeys(t *testing.T) {
+	raw := json.RawMessage(`{
+		"displayName":{"value":"DisplayName_x","isReadOnly":false,"isRequired":true},
+		"accusativeDisplayName":{"value":"AccusativeDisplayName_x","isReadOnly":false,"isRequired":true}
+	}`)
+	keys := displayNameKeys(raw)
+	if keys["displayName"] != "DisplayName_x" {
+		t.Errorf("displayName = %q", keys["displayName"])
+	}
+	if keys["accusativeDisplayName"] != "AccusativeDisplayName_x" {
+		t.Errorf("accusativeDisplayName = %q", keys["accusativeDisplayName"])
+	}
+	if _, ok := keys["collectionDisplayName"]; ok {
+		t.Error("collectionDisplayName не должен появляться, если его нет в метаданных")
+	}
+	// Пустое значение (ключ ресурса ещё не задан) пропускается.
+	if got := displayNameKeys(json.RawMessage(`{"displayName":{"value":""}}`)); len(got) != 0 {
+		t.Errorf("пустое значение должно пропускаться, получено %v", got)
+	}
+}

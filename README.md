@@ -150,9 +150,9 @@ Cookie лежит отдельным файлом и перечитываетс�
 
 ### Development Studio
 
-Если задать `RXMCP_STUDIO_URL` (WebSocket-адрес локальной Development Studio, например `ws://127.0.0.1:8362/rpc`), появляются инструменты `dev_*` для работы с разработкой напрямую по JSON-RPC. Помощник сможет открыть разработку, читать дерево и метаданные, создавать решения, модули, справочники и свойства, а также публиковать разработку в RX.
+Если задать `RXMCP_STUDIO_URL` (WebSocket-адрес локальной Development Studio, например `ws://127.0.0.1:8362/rpc`), появляются инструменты `dev_*` для работы с разработкой напрямую по JSON-RPC. Помощник сможет открыть разработку, читать дерево и метаданные, создавать решения, модули, справочники, типы документов, задачи и их подтипы (задания, уведомления, задания на ознакомление) и свойства, а также публиковать разработку в RX.
 
-Чтение: `dev_about`, `dev_configurations`, `dev_open_development`, `dev_tree`, `dev_get_metadata`. Запись (при `RXMCP_ALLOW_WRITE=1`): `dev_create_solution`, `dev_create_module`, `dev_create_databook`, `dev_create_item`, `dev_add_property`, `dev_set_localization`, `dev_set_parameter`, `dev_save_metadata`, `dev_delete_item`, `dev_delete_property`, `dev_call`, `dev_export_package`, `dev_save_nocode`. Публикация (отдельный флаг `RXMCP_STUDIO_ALLOW_DEPLOY=1`): `dev_validate`, `dev_publish`, `dev_apply_nocode`.
+Чтение: `dev_about`, `dev_configurations`, `dev_open_development`, `dev_tree`, `dev_get_metadata`. Запись (при `RXMCP_ALLOW_WRITE=1`): `dev_create_solution`, `dev_create_module`, `dev_create_databook`, `dev_create_document`, `dev_create_task`, `dev_create_assignment`, `dev_create_notice`, `dev_create_review_assignment`, `dev_create_item`, `dev_add_property`, `dev_set_localization`, `dev_set_parameter`, `dev_save_metadata`, `dev_delete_item`, `dev_delete_property`, `dev_call`, `dev_export_package`, `dev_save_nocode`. Публикация (отдельный флаг `RXMCP_STUDIO_ALLOW_DEPLOY=1`): `dev_validate`, `dev_publish`, `dev_apply_nocode`.
 
 ```sh
 rxmcp config set RXMCP_STUDIO_URL=ws://127.0.0.1:8362/rpc

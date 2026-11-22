@@ -287,8 +287,8 @@ func (s *Service) GetBaseTypes(ctx context.Context, parentID, metadataType strin
 }
 
 // DeleteItem удаляет объект разработки (DevelopmentBuilders/DeleteDevelopmentItem).
-func (s *Service) DeleteItem(ctx context.Context, id string) error {
-	_, err := s.call(ctx, "DevelopmentBuilders/DeleteDevelopmentItem", map[string]any{"id": id})
+func (s *Service) DeleteItem(ctx context.Context, id, metadataType string) error {
+	_, err := s.call(ctx, "DevelopmentBuilders/DeleteDevelopmentItem", map[string]any{"id": id, "metadataType": metadataType})
 	return err
 }
 
@@ -325,33 +325,99 @@ func (s *Service) CreateModule(ctx context.Context, parentID, name string, displ
 	return id, s.SaveMetadata(ctx, id, "Module")
 }
 
-// CreateDatabook создаёт справочник: базовый тип, три локализованных названия
-// (DisplayName, AccusativeDisplayName, CollectionDisplayName), сохранение и проверка.
-func (s *Service) CreateDatabook(ctx context.Context, parentID, name string, names map[string]map[string]string) (string, error) {
+// createNamedEntity создаёт объект заданного типа (Databook, Document, Task, Assignment,
+// Notice, ReviewAssignment): базовый тип по умолчанию, локализованные названия из names
+// (только те, что есть в метаданных этого типа), сохранение. Родитель — модуль для
+// справочника/документа/задачи и сам тип задачи для задания/уведомления/задания на
+// ознакомление.
+func (s *Service) createNamedEntity(ctx context.Context, parentID, name, metadataType string, names map[string]map[string]string) (string, error) {
 	baseID := ""
-	if bt, err := s.GetBaseTypes(ctx, parentID, "Databook"); err == nil {
+	if bt, err := s.GetBaseTypes(ctx, parentID, metadataType); err == nil {
 		baseID = firstBaseType(bt)
 	}
-	id, err := s.CreateItem(ctx, "Databook", parentID, name, baseID, false)
+	id, err := s.CreateItem(ctx, metadataType, parentID, name, baseID, false)
 	if err != nil {
 		return id, err
 	}
-	meta, err := s.GetMetadata(ctx, id, "Databook")
+	meta, err := s.GetMetadata(ctx, id, metadataType)
 	if err != nil {
 		return id, err
 	}
+	keys := displayNameKeys(meta)
 	for _, pair := range []struct{ key, metaField string }{
 		{"DisplayName", "displayName"},
 		{"AccusativeDisplayName", "accusativeDisplayName"},
 		{"CollectionDisplayName", "collectionDisplayName"},
 	} {
-		if vals, ok := names[pair.key]; ok && len(vals) > 0 {
-			if err := s.SetLocalization(ctx, id, "Databook", resourceKey(meta, pair.metaField), vals); err != nil {
-				return id, err
-			}
+		vals, ok := names[pair.key]
+		if !ok || len(vals) == 0 {
+			continue
+		}
+		resKey, exists := keys[pair.metaField]
+		if !exists {
+			continue // у этого типа нет такого названия
+		}
+		if err := s.SetLocalization(ctx, id, metadataType, resKey, vals); err != nil {
+			return id, err
 		}
 	}
-	return id, s.SaveMetadata(ctx, id, "Databook")
+	return id, s.SaveMetadata(ctx, id, metadataType)
+}
+
+// CreateDatabook создаёт справочник: базовый тип, локализованные названия и сохранение.
+func (s *Service) CreateDatabook(ctx context.Context, parentID, name string, names map[string]map[string]string) (string, error) {
+	return s.createNamedEntity(ctx, parentID, name, "Databook", names)
+}
+
+// CreateDocument создаёт тип документа.
+func (s *Service) CreateDocument(ctx context.Context, parentID, name string, names map[string]map[string]string) (string, error) {
+	return s.createNamedEntity(ctx, parentID, name, "Document", names)
+}
+
+// CreateTask создаёт тип задачи. Тип задачи может быть родителем заданий, уведомлений и
+// заданий на ознакомление: они создаются с parent_id = GUID этого типа задачи.
+func (s *Service) CreateTask(ctx context.Context, parentID, name string, names map[string]map[string]string) (string, error) {
+	return s.createNamedEntity(ctx, parentID, name, "Task", names)
+}
+
+// CreateAssignment создаёт задание — подвид задачи. Как и уведомление с заданием на
+// ознакомление, хранится в таблице заданий, но в Studio это отдельный тип.
+func (s *Service) CreateAssignment(ctx context.Context, parentID, name string, names map[string]map[string]string) (string, error) {
+	return s.createNamedEntity(ctx, parentID, name, "Assignment", names)
+}
+
+// CreateNotice создаёт уведомление — подвид задачи.
+func (s *Service) CreateNotice(ctx context.Context, parentID, name string, names map[string]map[string]string) (string, error) {
+	return s.createNamedEntity(ctx, parentID, name, "Notice", names)
+}
+
+// CreateReviewAssignment создаёт задание на ознакомление/рассмотрение — подвид задачи.
+func (s *Service) CreateReviewAssignment(ctx context.Context, parentID, name string, names map[string]map[string]string) (string, error) {
+	return s.createNamedEntity(ctx, parentID, name, "ReviewAssignment", names)
+}
+
+// displayNameKeys достаёт из метаданных ключи ресурсов для тех полей названия
+// (displayName, accusativeDisplayName, collectionDisplayName), которые есть у этого типа.
+func displayNameKeys(meta json.RawMessage) map[string]string {
+	out := map[string]string{}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(meta, &m) != nil {
+		return out
+	}
+	for _, field := range []string{"displayName", "accusativeDisplayName", "collectionDisplayName"} {
+		raw, ok := m[field]
+		if !ok {
+			continue
+		}
+		var v struct {
+			Value string `json:"value"`
+		}
+		if json.Unmarshal(raw, &v) != nil || v.Value == "" {
+			continue
+		}
+		out[field] = v.Value
+	}
+	return out
 }
 
 // --- свойства ---
@@ -359,7 +425,7 @@ func (s *Service) CreateDatabook(ctx context.Context, parentID, name string, nam
 // PropertyInput параметры нового свойства.
 type PropertyInput struct {
 	MetadataID     string            // GUID владельца (справочник/документ/задача/задание)
-	MetadataType   string            // Databook | Document | Task | Assignment
+	MetadataType   string            // Databook | Document | Task | Assignment | Notice | ReviewAssignment
 	Name           string            // техническое имя поля
 	Code           string            // внутренний код свойства; по умолчанию = Name
 	PropertyType   string            // String | Integer | Double | Boolean | DateTime | Navigation | Enumeration | Collection
@@ -413,6 +479,27 @@ func (s *Service) AddProperty(ctx context.Context, in PropertyInput) (string, er
 			return itemID, err
 		}
 	}
+	// Техническое имя и код свойства (по умолчанию автосгенерированы «Property1» и т.п.).
+	if err := s.ChangeElementParameter(ctx, in.MetadataType, in.MetadataID, "Property", itemID, "name", in.Name); err != nil {
+		return itemID, err
+	}
+	if err := s.ChangeElementParameter(ctx, in.MetadataType, in.MetadataID, "Property", itemID, "code", in.Name); err != nil {
+		return itemID, err
+	}
+	// Задаём тип данных свойства (String — по умолчанию, поэтому пропускаем).
+	if pt := in.PropertyType; pt != "" && !strings.EqualFold(pt, "String") {
+		if err := s.ChangeElementParameter(ctx, in.MetadataType, in.MetadataID, "Property", itemID, "propertyType", pt); err != nil {
+			return itemID, err
+		}
+	}
+	// Перечисление — варианты значений.
+	if strings.EqualFold(in.PropertyType, "Enumeration") {
+		for _, ev := range in.EnumValues {
+			if err := s.addEnumValue(ctx, in.MetadataType, in.MetadataID, itemID, in.Name, ev); err != nil {
+				return itemID, err
+			}
+		}
+	}
 	return itemID, s.SaveMetadata(ctx, in.MetadataID, in.MetadataType)
 }
 
@@ -440,9 +527,10 @@ func propertyDisplayNameKey(raw json.RawMessage, itemID string) string {
 	return ""
 }
 
-func (s *Service) addEnumValue(ctx context.Context, metadataType, metadataID string, ev EnumValueInput) error {
+func (s *Service) addEnumValue(ctx context.Context, metadataType, metadataID, propertyID, propertyName string, ev EnumValueInput) error {
+	// Создаём вариант перечисления в коллекции directValues свойства.
 	raw, err := s.callArray(ctx, editorMethod(metadataType, "EnumValue", "CreateMetadataElement"),
-		[]any{metadataID, ev.Name, []any{}, "EnumValue", nil})
+		[]any{metadataID, "Properties", []any{map[string]any{"itemId": propertyID, "metadataInnerPartType": "directValues"}}, "", "EnumValue", nil})
 	if err != nil {
 		return err
 	}
@@ -450,17 +538,23 @@ func (s *Service) addEnumValue(ctx context.Context, metadataType, metadataID str
 	if err != nil {
 		return err
 	}
-	if err := s.ChangeElementParameter(ctx, metadataType, metadataID, "EnumValue", itemID, "Name", ev.Name); err != nil {
+	// Задаём имя варианта: путь свойство → directValues → вариант → name.
+	paths := []any{
+		map[string]any{"itemId": propertyID, "metadataInnerPartType": "directValues"},
+		map[string]any{"itemId": itemID, "metadataInnerPartType": "name"},
+	}
+	if _, err := s.callArray(ctx, editorMethod(metadataType, "EnumValue", "ChangeMetadataElementParameter"),
+		[]any{metadataID, "Properties", paths, ev.Name}); err != nil {
 		return err
 	}
-	if len(ev.DisplayName) > 0 {
-		meta, err := s.GetMetadata(ctx, metadataID, metadataType)
-		if err != nil {
-			return err
-		}
-		if err := s.SetLocalization(ctx, metadataID, metadataType, resourceKey(meta, "displayName"), ev.DisplayName); err != nil {
-			return err
-		}
+	// Отображаемое имя варианта (обязательно).
+	displayName := ev.DisplayName
+	if len(displayName) == 0 {
+		displayName = map[string]string{"": ev.Name}
+	}
+	key := "Enum_" + propertyName + "_" + ev.Name + "_" + metadataID
+	if err := s.SetLocalization(ctx, metadataID, metadataType, key, displayName); err != nil {
+		return err
 	}
 	return nil
 }
@@ -468,10 +562,11 @@ func (s *Service) addEnumValue(ctx context.Context, metadataType, metadataID str
 // ChangeElementParameter меняет параметр элемента коллекции метаданных.
 // collection — сегмент в единственном числе: Property или EnumValue.
 func (s *Service) ChangeElementParameter(ctx context.Context, metadataType, metadataID, collection string, itemID string, paramName string, value any) error {
-	// ChangeMetadataElementParameter(developmentId, metadataId, paramName, metadataPaths, value) — позиционно.
+	// ChangeMetadataElementParameter(developmentId, metadataId, metadataPartType, metadataPaths, value) — позиционно.
+	// metadataPartType всегда "Properties" (коллекция верхнего уровня); параметр задаётся в metadataInnerPartType.
 	paths := []any{map[string]any{"itemId": itemID, "metadataInnerPartType": paramName}}
 	_, err := s.callArray(ctx, editorMethod(metadataType, collection, "ChangeMetadataElementParameter"),
-		[]any{metadataID, paramName, paths, value})
+		[]any{metadataID, "Properties", paths, value})
 	return err
 }
 

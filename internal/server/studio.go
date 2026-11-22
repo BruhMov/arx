@@ -26,7 +26,7 @@ type openDevIn struct {
 
 type metadataIn struct {
 	MetadataID   string `json:"metadata_id" jsonschema:"GUID объекта (решение, модуль, справочник, тип документа/задачи/задания)"`
-	MetadataType string `json:"metadata_type" jsonschema:"Solution, Module, Databook, Document, Task или Assignment"`
+	MetadataType string `json:"metadata_type" jsonschema:"Solution, Module, Databook, Document, Task, Assignment, Notice или ReviewAssignment"`
 }
 
 func (s *Server) registerStudioRead() {
@@ -109,16 +109,16 @@ type createModuleIn struct {
 	IsVisible   *bool             `json:"is_visible,omitempty" jsonschema:"true = видимый модуль, false = скрытый; по умолчанию не меняется"`
 }
 
-type createDatabookIn struct {
-	ParentID   string            `json:"parent_id" jsonschema:"GUID родительского модуля (из dev_tree)"`
-	Name       string            `json:"name" jsonschema:"техническое имя справочника"`
+type createEntityIn struct {
+	ParentID   string            `json:"parent_id" jsonschema:"GUID родителя из dev_tree: модуль для справочника/документа/задачи; тип задачи для задания/уведомления/задания на ознакомление"`
+	Name       string            `json:"name" jsonschema:"техническое имя объекта"`
 	Display    map[string]string `json:"display_name,omitempty" jsonschema:"именительный падеж по локалям, например «Поставщик»"`
 	Accusative map[string]string `json:"accusative_name,omitempty" jsonschema:"винительный падеж, например «Поставщика»"`
 	Collection map[string]string `json:"collection_name,omitempty" jsonschema:"множественное число, например «Поставщики»"`
 }
 
 type createItemIn struct {
-	MetadataType string `json:"metadata_type" jsonschema:"Solution, Module, Databook, Document, Task или Assignment"`
+	MetadataType string `json:"metadata_type" jsonschema:"Solution, Module, Databook, Document, Task, Assignment, Notice или ReviewAssignment"`
 	ParentID     string `json:"parent_id,omitempty" jsonschema:"GUID родителя; для Solution не передавайте"`
 	Name         string `json:"name" jsonschema:"техническое имя"`
 	BaseID       string `json:"base_id,omitempty" jsonschema:"GUID базового типа (из dev_get_base_types); по умолчанию тип Studio"`
@@ -127,7 +127,7 @@ type createItemIn struct {
 
 type addPropertyIn struct {
 	MetadataID     string            `json:"metadata_id" jsonschema:"GUID владельца свойства (справочник/документ/задача/задание)"`
-	MetadataType   string            `json:"metadata_type" jsonschema:"Databook, Document, Task или Assignment"`
+	MetadataType   string            `json:"metadata_type" jsonschema:"Databook, Document, Task, Assignment, Notice или ReviewAssignment"`
 	Name           string            `json:"name" jsonschema:"техническое имя поля"`
 	Code           string            `json:"code,omitempty" jsonschema:"внутренний код свойства; по умолчанию равен name"`
 	PropertyType   string            `json:"property_type,omitempty" jsonschema:"String (по умолчанию), Integer, Double, Boolean, DateTime, Navigation, Enumeration или Collection"`
@@ -148,24 +148,25 @@ type enumValueIn struct {
 
 type localizationIn struct {
 	MetadataID   string            `json:"metadata_id" jsonschema:"GUID объекта"`
-	MetadataType string            `json:"metadata_type" jsonschema:"Solution, Module, Databook, Document, Task или Assignment"`
+	MetadataType string            `json:"metadata_type" jsonschema:"Solution, Module, Databook, Document, Task, Assignment, Notice или ReviewAssignment"`
 	Key          string            `json:"key" jsonschema:"ключ ресурса локализации (например DisplayName; ключи отдаёт dev_get_metadata)"`
 	Values       map[string]string `json:"values" jsonschema:"текст по локалям: \"\" нейтральная, «ru»/«ru-RU» русские"`
 }
 
 type parameterIn struct {
 	MetadataID   string `json:"metadata_id" jsonschema:"GUID объекта"`
-	MetadataType string `json:"metadata_type" jsonschema:"Solution, Module, Databook, Document, Task или Assignment"`
+	MetadataType string `json:"metadata_type" jsonschema:"Solution, Module, Databook, Document, Task, Assignment, Notice или ReviewAssignment"`
 	Name         string `json:"name" jsonschema:"имя параметра, например IsVisible, IsRequired"`
 	Value        any    `json:"value" jsonschema:"новое значение параметра"`
 }
 
 type deleteItemIn struct {
-	ID string `json:"id" jsonschema:"GUID объекта разработки (из dev_tree или результата создания)"`
+	ID           string `json:"id" jsonschema:"GUID объекта разработки (из dev_tree или результата создания)"`
+	MetadataType string `json:"metadata_type" jsonschema:"тип объекта: Solution, Module, Databook, Document, Task, Assignment, Notice или ReviewAssignment"`
 }
 
 type deletePropertyIn struct {
-	MetadataType string `json:"metadata_type" jsonschema:"Databook, Document, Task или Assignment"`
+	MetadataType string `json:"metadata_type" jsonschema:"Databook, Document, Task, Assignment, Notice или ReviewAssignment"`
 	MetadataID   string `json:"metadata_id" jsonschema:"GUID владельца свойства"`
 	ItemID       string `json:"item_id" jsonschema:"itemId свойства (из dev_get_metadata или результата создания)"`
 }
@@ -227,38 +228,19 @@ func (s *Server) registerStudioWrite() {
 			return fail(err)
 		}
 		s.log.Info("module created", "id", id)
-		return text(fmt.Sprintf("Модуль «%s» создан (GUID %s).\nСправочники в него: dev_create_databook с parent_id=%s.", in.Name, id, id)), nil, nil
+		return text(fmt.Sprintf("Модуль «%s» создан (GUID %s).\nОбъекты в него: dev_create_databook, dev_create_document, dev_create_task с parent_id=%s.", in.Name, id, id)), nil, nil
 	})
 
-	mcp.AddTool(s.MCP, &mcp.Tool{
-		Name:        "dev_create_databook",
-		Description: "Создать справочник в модуле Development Studio: техническое имя и три локализованных названия (именительный, винительный, множественное число). Возвращает GUID справочника — передавайте его как metadata_id при добавлении свойств. Меняет метаданные разработки; в RX изменения появятся после публикации. Перед вызовом перескажите пользователю имена.",
-		Annotations: rw("Создать справочник", false),
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in createDatabookIn) (*mcp.CallToolResult, any, error) {
-		if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.ParentID) == "" {
-			return fail(errors.New("нужны parent_id (модуль) и name (техническое имя справочника)"))
-		}
-		msg := fmt.Sprintf("Создать справочник «%s» в модуле %s", in.Name, in.ParentID)
-		if ok, err := s.confirm(ctx, req, msg+"?"); err != nil || !ok {
-			return declined(err)
-		}
-		names := map[string]map[string]string{}
-		if len(in.Display) > 0 {
-			names["DisplayName"] = in.Display
-		}
-		if len(in.Accusative) > 0 {
-			names["AccusativeDisplayName"] = in.Accusative
-		}
-		if len(in.Collection) > 0 {
-			names["CollectionDisplayName"] = in.Collection
-		}
-		id, err := st.CreateDatabook(ctx, in.ParentID, in.Name, names)
-		if err != nil {
-			return fail(err)
-		}
-		s.log.Info("databook created", "id", id)
-		return text(fmt.Sprintf("Справочник «%s» создан (GUID %s).\nСвойства: dev_add_property с metadata_id=%s.", in.Name, id, id)), nil, nil
-	})
+	s.registerCreateEntityTool("dev_create_databook", "Создать справочник", "справочник", "Справочник", "создан", "", st.CreateDatabook)
+	s.registerCreateEntityTool("dev_create_document", "Создать тип документа", "тип документа", "Тип документа", "создан", "", st.CreateDocument)
+	s.registerCreateEntityTool("dev_create_task", "Создать тип задачи", "тип задачи", "Тип задачи", "создан",
+		" Тип задачи может быть родителем заданий, уведомлений и заданий на ознакомление — его GUID передавайте как parent_id этих подтипов.", st.CreateTask)
+	s.registerCreateEntityTool("dev_create_assignment", "Создать задание", "задание", "Задание", "создано",
+		" Подвид задачи: как уведомление и задание на ознакомление хранится в таблице заданий, но в Studio это отдельный тип; parent_id — тип задачи.", st.CreateAssignment)
+	s.registerCreateEntityTool("dev_create_notice", "Создать уведомление", "уведомление", "Уведомление", "создано",
+		" Подвид задачи; parent_id — тип задачи.", st.CreateNotice)
+	s.registerCreateEntityTool("dev_create_review_assignment", "Создать задание на ознакомление", "задание на ознакомление", "Задание на ознакомление", "создано",
+		" Подвид задачи; parent_id — тип задачи.", st.CreateReviewAssignment)
 
 	mcp.AddTool(s.MCP, &mcp.Tool{
 		Name:        "dev_create_item",
@@ -374,13 +356,17 @@ func (s *Server) registerStudioWrite() {
 		Description: "Удалить объект разработки Development Studio по GUID. Необратимо. Перед вызовом перескажите пользователю, какой объект будет удалён.",
 		Annotations: rw("Удалить объект", true),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in deleteItemIn) (*mcp.CallToolResult, any, error) {
+		mt, err := normalizeMetadataType(in.MetadataType, true)
+		if err != nil {
+			return fail(err)
+		}
 		if strings.TrimSpace(in.ID) == "" {
 			return fail(errors.New("нужен id объекта"))
 		}
-		if ok, err := s.confirm(ctx, req, fmt.Sprintf("Удалить объект разработки %s? Это необратимо.", in.ID)); err != nil || !ok {
+		if ok, err := s.confirm(ctx, req, fmt.Sprintf("Удалить объект разработки %s (%s)? Это необратимо.", in.ID, mt)); err != nil || !ok {
 			return declined(err)
 		}
-		if err := st.DeleteItem(ctx, in.ID); err != nil {
+		if err := st.DeleteItem(ctx, in.ID, mt); err != nil {
 			return fail(err)
 		}
 		s.log.Info("development item deleted", "id", in.ID)
@@ -472,6 +458,45 @@ func (s *Server) registerStudioWrite() {
 			return fail(err)
 		}
 		return text(fmt.Sprintf("NoCode-настройка %s (%s) сохранена. Примените: dev_apply_nocode.", kind, in.ID)), nil, nil
+	})
+}
+
+// createEntityFn сигнатура методов создания типового объекта разработки.
+type createEntityFn func(context.Context, string, string, map[string]map[string]string) (string, error)
+
+// registerCreateEntityTool регистрирует инструмент создания типового объекта разработки
+// (справочник, документ, задача и подтипы задачи). kind — название объекта в винительном
+// падеже для сообщений, resultNoun — именительный с заглавной для результата, created —
+// «создан»/«создано», parentNote — пояснение про родителя (вставляется в описание).
+func (s *Server) registerCreateEntityTool(name, title, kind, resultNoun, created, parentNote string, create createEntityFn) {
+	mcp.AddTool(s.MCP, &mcp.Tool{
+		Name:        name,
+		Description: fmt.Sprintf("Создать %s в Development Studio: техническое имя и локализованные названия (именительный, винительный, множественное число — применимые к типу).%s Возвращает GUID — передавайте его как metadata_id при добавлении свойств. Меняет метаданные разработки; в RX изменения появятся после публикации. Перед вызовом перескажите пользователю имена.", kind, parentNote),
+		Annotations: rw(title, false),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in createEntityIn) (*mcp.CallToolResult, any, error) {
+		if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.ParentID) == "" {
+			return fail(errors.New("нужны parent_id и name (техническое имя)"))
+		}
+		msg := fmt.Sprintf("Создать %s «%s» в родителе %s", kind, in.Name, in.ParentID)
+		if ok, err := s.confirm(ctx, req, msg+"?"); err != nil || !ok {
+			return declined(err)
+		}
+		names := map[string]map[string]string{}
+		if len(in.Display) > 0 {
+			names["DisplayName"] = in.Display
+		}
+		if len(in.Accusative) > 0 {
+			names["AccusativeDisplayName"] = in.Accusative
+		}
+		if len(in.Collection) > 0 {
+			names["CollectionDisplayName"] = in.Collection
+		}
+		id, err := create(ctx, in.ParentID, in.Name, names)
+		if err != nil {
+			return fail(err)
+		}
+		s.log.Info("development entity created", "kind", kind, "id", id)
+		return text(fmt.Sprintf("%s «%s» %s (GUID %s).\nСвойства: dev_add_property с metadata_id=%s.", resultNoun, in.Name, created, id, id)), nil, nil
 	})
 }
 
@@ -572,7 +597,7 @@ func enumValues(in []enumValueIn) []studio.EnumValueInput {
 // normalizeMetadataType проверяет и приводит тип объекта разработки.
 func normalizeMetadataType(t string, allowAbstractKinds bool) (string, error) {
 	t = strings.TrimSpace(t)
-	allowed := []string{"Databook", "Document", "Task", "Assignment"}
+	allowed := []string{"Databook", "Document", "Task", "Assignment", "Notice", "ReviewAssignment"}
 	if allowAbstractKinds {
 		allowed = append(allowed, "Solution", "Module")
 	}
